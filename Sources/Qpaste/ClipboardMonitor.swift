@@ -103,16 +103,24 @@ final class ClipboardMonitor {
             }
         }
 
-        let richText = pasteboard.data(forType: .rtf)
-        let text = pasteboard.string(forType: .string) ?? pasteboard.string(forType: .URL)
+        let richData = pasteboard.data(forType: .rtf)
+        let plainText = pasteboard.string(forType: .string) ?? pasteboard.string(forType: .URL)
+        return try captureText(plainText, richData: richData, sourceName: name, sourceBundleID: bundleID)
+    }
+
+    static func captureText(_ plainText: String?, richData: Data?, sourceName: String, sourceBundleID: String?) throws -> CapturedClipboard? {
+        let richText = richData.flatMap { $0.count <= maximumTextBytes ? $0 : nil }
+        // Avoid parsing an unbounded RTF document just to extract a small body.
+        if plainText == nil, richData != nil, richText == nil { throw CaptureError.richTextTooLarge }
+        let text = plainText
             ?? richText.flatMap { NSAttributedString(rtf: $0, documentAttributes: nil)?.string }
         guard let text, !text.isEmpty else { return nil }
         guard text.utf8.count <= maximumTextBytes else { throw CaptureError.textTooLarge }
-        let rtf = richText.flatMap { $0.count <= maximumTextBytes ? $0 : nil }
+        let rtf = richText
         let kind = ClipboardEntry.kind(for: text)
         let fingerprint = ClipboardEntry.digest(Data((kind.rawValue + ":" + text).utf8) + (rtf ?? Data()))
         return CapturedClipboard(entry: ClipboardEntry(kind: kind, text: text, richText: rtf,
-            fingerprint: fingerprint, sourceName: name, sourceBundleID: bundleID))
+            fingerprint: fingerprint, sourceName: sourceName, sourceBundleID: sourceBundleID))
     }
 
     func write(_ entry: ClipboardEntry, plainText: Bool) throws {
@@ -152,11 +160,12 @@ final class ClipboardMonitor {
 }
 
 enum CaptureError: LocalizedError {
-    case imageTooLarge, textTooLarge, missingImage, missingFile, noText, writeFailed
+    case imageTooLarge, textTooLarge, richTextTooLarge, missingImage, missingFile, noText, writeFailed
     var errorDescription: String? {
         switch self {
         case .imageTooLarge: return "这张图片过大，未加入历史（上限 20 MB / 4000 万像素）"
         case .textTooLarge: return "这段文本超过 2 MB，未加入历史"
+        case .richTextTooLarge: return "这段富文本超过 2 MB，未加入历史；可复制为纯文本后重试"
         case .missingImage: return "图片文件无法读取"
         case .missingFile: return "原文件已移动或删除，无法再次粘贴；仍可复制文件路径"
         case .noText: return "图片没有可粘贴的文本"

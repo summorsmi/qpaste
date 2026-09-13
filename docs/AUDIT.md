@@ -28,3 +28,9 @@
 新增实际 PNG 测试验证显示预览为 1400×800，而大图查看器和剪贴板仍保留 2800×1600；长图限额与原始文件内容不变。
 
 使用 Image I/O 的缩略解码接口，依据 [Apple 图像内存说明](https://developer.apple.com/videos/play/wwdc2018/416/)。缓存额度是回收提示，不是整个进程的硬上限，见 [Apple NSCache 文档](https://developer.apple.com/documentation/foundation/nscache/totalcostlimit)。
+
+## 已修复：富文本在大小限制前就被解析
+
+仅提供 RTF 的剪贴板原来先完整解析文档，再检查正文长度，超大格式数据也能进入解析器。现在 RTF 超过 2 MB 时不进入解析；若同时提供了普通文本，仍正常记录普通文本，只省略过大的格式数据。
+
+使用带超大可忽略 RTF 分组、正文仅为 `visible` 的合成样例验证解析边界。macOS 会给 RTF 自动提供普通文本类型，因此测试分别覆盖原始 RTF 回退解析与真实剪贴板的普通文本回退；本项只限制 Qpaste 自身的 RTF 解析，不声称控制系统剪贴板服务的格式转换。日期集成测试同时改用微秒容差，避免时间在 JSON / SQLite 基准之间转换时的浮点舍入导致偶发失败。

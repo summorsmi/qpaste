@@ -88,6 +88,24 @@ struct ClipboardTests {
         }
     }
 
+    @Test func oversizedRichTextIsBoundedBeforeParsingButPlainFallbackStillWorks() throws {
+        try withFixture { _, _, pasteboard in
+            let ignored = String(repeating: "x", count: ClipboardMonitor.maximumTextBytes)
+            let rtf = Data(("{\\rtf1\\ansi {\\*\\qpastesample " + ignored + "}visible}").utf8)
+            pasteboard.setData(rtf, forType: .rtf)
+            // macOS may synthesize a string flavor for an RTF-only pasteboard.
+            // Exercise the raw RTF fallback directly, then the real plain flavor.
+            #expect(throws: CaptureError.self) {
+                try ClipboardMonitor.captureText(nil, richData: rtf, sourceName: "Test", sourceBundleID: nil)
+            }
+            pasteboard.setString("plain fallback", forType: .string)
+            let fallback = try ClipboardMonitor.capture(from: pasteboard, sourceName: "Test", sourceBundleID: nil)
+            let captured = try #require(fallback)
+            #expect(captured.entry.text == "plain fallback")
+            #expect(captured.entry.richText == nil)
+        }
+    }
+
     @Test func imagesSurviveCaptureDiskAndClipboardRestore() throws {
         try withFixture { store, monitor, pasteboard in
             let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 8, pixelsHigh: 6, bitsPerSample: 8,
@@ -279,17 +297,18 @@ struct ClipboardTests {
             store.query = "earlier"
             let oldCopy = try #require(store.selected)
             #expect(oldCopy.id == id)
-            #expect(oldCopy.lastCopiedAt == yesterday)
+            #expect(abs(oldCopy.lastCopiedAt.timeIntervalSince(yesterday)) < 0.000001)
             store.toggleFavorite(oldCopy)
             store.flush()
             let persisted = try #require(store.repository.load().first)
-            #expect(persisted.lastCopiedAt == today)
+            #expect(abs(persisted.lastCopiedAt.timeIntervalSince(today)) < 0.000001)
             #expect(persisted.sourceName == "Latest App")
             #expect(persisted.isFavorite)
             #expect(try store.repository.copyEvents(for: id).count == 2)
             store.dateFilter = .all
             store.query = ""
-            #expect(store.selected?.lastCopiedAt == today)
+            let selected = try #require(store.selected)
+            #expect(abs(selected.lastCopiedAt.timeIntervalSince(today)) < 0.000001)
         }
     }
 
