@@ -36,6 +36,8 @@ public struct ClipboardEntry: Identifiable, Codable, Equatable, Sendable {
     public var fingerprint: String
     public var createdAt: Date
     public var lastCopiedAt: Date
+    public var updatedAt: Date?
+    public var displayDate: Date { isSnippet ? (updatedAt ?? lastCopiedAt) : lastCopiedAt }
     public var sourceName: String
     public var sourceBundleID: String?
     public var isFavorite: Bool
@@ -61,6 +63,7 @@ public struct ClipboardEntry: Identifiable, Codable, Equatable, Sendable {
         self.sourceBundleID = sourceBundleID
         createdAt = now
         lastCopiedAt = now
+        updatedAt = snippetName == nil ? nil : now
         self.isFavorite = isFavorite
         self.snippetName = snippetName
     }

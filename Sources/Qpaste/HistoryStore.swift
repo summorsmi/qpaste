@@ -65,7 +65,9 @@ final class HistoryStore: ObservableObject {
         }
         entries = policy.inserting(entry, into: entries)
         reconcileSelection()
-        persist(imageData: imageData)
+        let retained = entries.first { $0.fingerprint == entry.fingerprint }
+        let event = retained.map { CopyEvent(entryID: $0.id, copiedAt: entry.lastCopiedAt, sourceName: entry.sourceName, sourceBundleID: entry.sourceBundleID) }
+        persist(imageData: imageData, copyEvent: event)
     }
 
     func toggleFavorite(_ entry: ClipboardEntry) {
@@ -107,7 +109,7 @@ final class HistoryStore: ObservableObject {
             entries[index].text = draft.body
             entries[index].snippetName = name
             entries[index].byteCount = draft.body.utf8.count
-            entries[index].lastCopiedAt = Date()
+            entries[index].updatedAt = Date()
             savedID = entries[index].id
         } else {
             let entry = ClipboardEntry(kind: .text, text: draft.body,
@@ -176,14 +178,14 @@ final class HistoryStore: ObservableObject {
         }
     }
 
-    private func persist(imageData: Data? = nil) {
+    private func persist(imageData: Data? = nil, copyEvent: CopyEvent? = nil) {
         guard canSave else { return }
         let snapshot = entries
         let repository = repository
         ioQueue.async { [weak self] in
             do {
                 if let imageData { _ = try repository.saveImage(imageData) }
-                try repository.save(snapshot)
+                try repository.save(snapshot, copyEvent: copyEvent)
                 try repository.removeUnreferencedImages(keeping: snapshot)
             } catch {
                 Task { @MainActor [weak self] in

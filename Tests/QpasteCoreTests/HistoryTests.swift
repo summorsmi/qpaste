@@ -112,7 +112,7 @@ struct HistoryTests {
         let entries = [ClipboardEntry(kind: .text, text: "你好\nworld", richText: Data([1, 2, 3]), now: now, snippetName: "签名")]
         try repository.save(entries)
         #expect(try repository.load() == entries)
-        let permissions = try FileManager.default.attributesOfItem(atPath: repository.archiveURL.path)[.posixPermissions] as? Int
+        let permissions = try FileManager.default.attributesOfItem(atPath: repository.databaseURL.path)[.posixPermissions] as? Int
         #expect(permissions == 0o600)
     }
 

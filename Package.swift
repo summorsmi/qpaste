@@ -6,7 +6,8 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [.executable(name: "Qpaste", targets: ["Qpaste"])],
     targets: [
-        .target(name: "QpasteCore"),
+        .systemLibrary(name: "CSQLite"),
+        .target(name: "QpasteCore", dependencies: ["CSQLite"]),
         .executableTarget(name: "Qpaste", dependencies: ["QpasteCore"]),
         .testTarget(name: "QpasteCoreTests", dependencies: ["QpasteCore"]),
         .testTarget(name: "QpasteTests", dependencies: ["Qpaste", "QpasteCore"])
