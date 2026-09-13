@@ -2,3 +2,12 @@
 dist/
 .DS_Store
 *.xcuserstate
+
+# Local signing identities and recovery material must stay on this Mac.
+*.p12
+*.pfx
+*.key
+*.pem
+*.keychain*
+backup-password.txt
+QpasteSigning/
