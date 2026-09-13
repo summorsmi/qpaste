@@ -81,7 +81,7 @@ public final class HistoryRepository: @unchecked Sendable {
         else { db = try SQLiteDatabase(url: databaseURL); database = db }
         if !ready {
             let version = Int(try db.rows("PRAGMA user_version").first?.first?.double ?? 0)
-            guard version <= 2 else { throw SQLiteFailure(message: "版本不受支持，原数据库未修改") }
+            guard version <= 3 else { throw SQLiteFailure(message: "版本不受支持，原数据库未修改") }
             try db.transaction {
                 try db.execute("""
                     CREATE TABLE IF NOT EXISTS entries(
@@ -89,7 +89,8 @@ public final class HistoryRepository: @unchecked Sendable {
                         is_favorite INTEGER NOT NULL, is_snippet INTEGER NOT NULL,
                         copied_at REAL NOT NULL, display_at REAL NOT NULL, byte_count INTEGER NOT NULL,
                         image_file TEXT, payload BLOB NOT NULL,
-                        search_text TEXT NOT NULL DEFAULT '', source_name TEXT NOT NULL DEFAULT '', source_bundle TEXT);
+                        search_text TEXT NOT NULL DEFAULT '', source_name TEXT NOT NULL DEFAULT '', source_bundle TEXT,
+                        list_payload BLOB NOT NULL DEFAULT X'7B7D', revision TEXT NOT NULL DEFAULT '');
                     CREATE INDEX IF NOT EXISTS entries_time ON entries(display_at DESC, id DESC);
                     CREATE INDEX IF NOT EXISTS entries_fingerprint ON entries(fingerprint);
                     CREATE TABLE IF NOT EXISTS copy_events(
@@ -101,8 +102,24 @@ public final class HistoryRepository: @unchecked Sendable {
                     """)
                 if version == 1 {
                     try db.execute("ALTER TABLE entries ADD COLUMN search_text TEXT NOT NULL DEFAULT ''; ALTER TABLE entries ADD COLUMN source_name TEXT NOT NULL DEFAULT ''; ALTER TABLE entries ADD COLUMN source_bundle TEXT;")
-                    for row in try db.rows("SELECT payload FROM entries") {
-                        try upsert(JSONDecoder().decode(ClipboardEntry.self, from: row[0].bytes), in: db)
+                }
+                if version == 1 || version == 2 {
+                    try db.execute("ALTER TABLE entries ADD COLUMN list_payload BLOB NOT NULL DEFAULT X'7B7D'; ALTER TABLE entries ADD COLUMN revision TEXT NOT NULL DEFAULT '';")
+                    // Backfill one body at a time. Never materialize the entire archive
+                    // in RAM, or rewrite existing body bytes and copy occurrences.
+                    var lastRowID: Int?
+                    while let row = try db.rows("SELECT rowid,payload FROM entries" + (lastRowID == nil ? "" : " WHERE rowid>?") + " ORDER BY rowid LIMIT 1",
+                                               lastRowID.map { [.integer($0)] } ?? []).first {
+                        guard case .integer(let rowID) = row[0] else { throw SQLiteFailure(message: "记录索引无法读取") }
+                        let entry = try JSONDecoder().decode(ClipboardEntry.self, from: row[1].bytes)
+                        let item = HistoryListItem(entry)
+                        try db.run("UPDATE entries SET list_payload=?,revision=? WHERE rowid=?",
+                                   [.data(try JSONEncoder().encode(item)), .text(item.revision), .integer(rowID)])
+                        if version == 1 {
+                            try db.run("UPDATE entries SET search_text=?,source_name=?,source_bundle=? WHERE rowid=?",
+                                       [.text(searchText(entry)), .text(entry.sourceName), entry.sourceBundleID.map(SQLValue.text) ?? .null, .integer(rowID)])
+                        }
+                        lastRowID = rowID
                     }
                 }
                 if try db.rows("SELECT value FROM metadata WHERE key='legacy_imported'").isEmpty {
@@ -120,7 +137,7 @@ public final class HistoryRepository: @unchecked Sendable {
                     }
                     try db.run("INSERT INTO metadata(key,value) VALUES('legacy_imported','1')")
                 }
-                try db.execute("PRAGMA user_version=2")
+                try db.execute("PRAGMA user_version=3")
             }
             ready = true
             legacyImportFailed = false
@@ -131,22 +148,28 @@ public final class HistoryRepository: @unchecked Sendable {
     private func upsert(_ entry: ClipboardEntry, in db: SQLiteDatabase) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
+        let item = HistoryListItem(entry)
         try db.run("""
-            INSERT INTO entries(id,fingerprint,kind,is_favorite,is_snippet,copied_at,display_at,byte_count,image_file,payload,search_text,source_name,source_bundle)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            INSERT INTO entries(id,fingerprint,kind,is_favorite,is_snippet,copied_at,display_at,byte_count,image_file,payload,search_text,source_name,source_bundle,list_payload,revision)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET fingerprint=excluded.fingerprint, kind=excluded.kind,
                 is_favorite=excluded.is_favorite, is_snippet=excluded.is_snippet,
                 copied_at=excluded.copied_at, display_at=excluded.display_at, byte_count=excluded.byte_count,
                 image_file=excluded.image_file, payload=excluded.payload,
-                search_text=excluded.search_text, source_name=excluded.source_name, source_bundle=excluded.source_bundle
+                search_text=excluded.search_text, source_name=excluded.source_name, source_bundle=excluded.source_bundle,
+                list_payload=excluded.list_payload, revision=excluded.revision
                 WHERE entries.payload<>excluded.payload OR entries.search_text<>excluded.search_text
             """, [.text(entry.id.uuidString), .text(entry.fingerprint), .text(entry.kind.rawValue),
                     .integer(entry.isFavorite ? 1 : 0), .integer(entry.isSnippet ? 1 : 0),
                     .number(entry.lastCopiedAt.timeIntervalSince1970), .number(entry.displayDate.timeIntervalSince1970),
                     .integer(entry.byteCount), entry.imageFileName.map(SQLValue.text) ?? .null,
                     .data(try encoder.encode(entry)),
-                    .text([entry.text, entry.title, entry.filePaths.joined(separator: " ")].joined(separator: "\n")),
-                    .text(entry.sourceName), entry.sourceBundleID.map(SQLValue.text) ?? .null])
+                    .text(searchText(entry)), .text(entry.sourceName), entry.sourceBundleID.map(SQLValue.text) ?? .null,
+                    .data(try encoder.encode(item)), .text(item.revision)])
+    }
+
+    private func searchText(_ entry: ClipboardEntry) -> String {
+        [entry.text, entry.title, entry.filePaths.joined(separator: " ")].joined(separator: "\n")
     }
 
     private func seedKnownEvents(_ entry: ClipboardEntry, in db: SQLiteDatabase) throws {
@@ -205,6 +228,13 @@ public final class HistoryRepository: @unchecked Sendable {
 }
 
 extension HistoryRepository {
+    public func content(for item: HistoryListItem) throws -> ClipboardEntry? {
+        try withDatabase { db in
+            try db.rows("SELECT payload FROM entries WHERE id=? AND revision=?", [.text(item.id.uuidString), .text(item.revision)]).first
+                .map { item.displaying(try JSONDecoder().decode(ClipboardEntry.self, from: $0[0].bytes)) }
+        }
+    }
+
     public func entry(id: UUID) throws -> ClipboardEntry? {
         try withDatabase { db in
             try db.rows("SELECT payload FROM entries WHERE id=?", [.text(id.uuidString)]).first
@@ -281,6 +311,34 @@ extension HistoryRepository {
     }
 
     public func page(_ query: HistoryQuery = HistoryQuery(), limit: Int = 80, offset: Int = 0) throws -> HistoryPage {
+        let result = try pageRows(query, limit: limit, offset: offset, column: "payload")
+        let entries = try result.rows.map { row -> ClipboardEntry in
+            var entry = try JSONDecoder().decode(ClipboardEntry.self, from: row[0].bytes)
+            if query.interval != nil && !entry.isSnippet {
+                entry.lastCopiedAt = Date(timeIntervalSince1970: row[1].double)
+                entry.sourceName = row[2].string
+                entry.sourceBundleID = row[3].string.isEmpty ? nil : row[3].string
+            }
+            return entry
+        }
+        return HistoryPage(entries: entries, totalCount: result.totalCount)
+    }
+
+    public func listPage(_ query: HistoryQuery = HistoryQuery(), limit: Int = 80, offset: Int = 0) throws -> HistoryListPage {
+        let result = try pageRows(query, limit: limit, offset: offset, column: "list_payload")
+        let entries = try result.rows.map { row -> HistoryListItem in
+            var item = try JSONDecoder().decode(HistoryListItem.self, from: row[0].bytes)
+            if query.interval != nil && !item.isSnippet {
+                item.lastCopiedAt = Date(timeIntervalSince1970: row[1].double)
+                item.sourceName = row[2].string
+                item.sourceBundleID = row[3].string.isEmpty ? nil : row[3].string
+            }
+            return item
+        }
+        return HistoryListPage(entries: entries, totalCount: result.totalCount)
+    }
+
+    private func pageRows(_ query: HistoryQuery, limit: Int, offset: Int, column: String) throws -> (rows: [[SQLValue]], totalCount: Int) {
         try withDatabase { db in
             try db.transaction(readOnly: true) {
                 var values = [SQLValue]()
@@ -290,7 +348,7 @@ extension HistoryRepository {
                         WITH matching AS (
                             SELECT entry_id,MAX(copied_at) AS at FROM copy_events WHERE copied_at>=? AND copied_at<? GROUP BY entry_id
                         ), candidates AS (
-                            SELECT e.*,CASE WHEN e.is_snippet=1 THEN e.display_at ELSE m.at END AS sort_at,
+                            SELECT e.id,e.kind,e.is_favorite,e.is_snippet,e.search_text,e.\(column) AS content,CASE WHEN e.is_snippet=1 THEN e.display_at ELSE m.at END AS sort_at,
                                 CASE WHEN e.is_snippet=1 THEN e.source_name ELSE
                                     (SELECT source_name FROM copy_events WHERE entry_id=e.id AND copied_at=m.at ORDER BY id DESC LIMIT 1) END AS matched_source,
                                 CASE WHEN e.is_snippet=1 THEN e.source_bundle ELSE
@@ -302,7 +360,7 @@ extension HistoryRepository {
                     values = [.number(range.start.timeIntervalSince1970), .number(range.end.timeIntervalSince1970),
                               .number(range.start.timeIntervalSince1970), .number(range.end.timeIntervalSince1970)]
                 } else {
-                    base = "WITH candidates AS (SELECT *,display_at AS sort_at,source_name AS matched_source,source_bundle AS matched_bundle FROM entries)"
+                    base = "WITH candidates AS (SELECT id,kind,is_favorite,is_snippet,search_text,\(column) AS content,display_at AS sort_at,source_name AS matched_source,source_bundle AS matched_bundle FROM entries)"
                 }
                 var predicate = "1=1"
                 switch query.filter {
@@ -316,18 +374,9 @@ extension HistoryRepository {
                     values.append(.text(query.text))
                 }
                 let count = Int(try db.rows(base + " SELECT COUNT(*) FROM candidates WHERE " + predicate, values).first?.first?.double ?? 0)
-                let rows = try db.rows(base + " SELECT payload,sort_at,matched_source,matched_bundle FROM candidates WHERE " + predicate + " ORDER BY sort_at DESC,id DESC LIMIT ? OFFSET ?",
+                let rows = try db.rows(base + " SELECT content,sort_at,matched_source,matched_bundle FROM candidates WHERE " + predicate + " ORDER BY sort_at DESC,id DESC LIMIT ? OFFSET ?",
                                        values + [.integer(max(1, limit)), .integer(max(0, offset))])
-                let entries = try rows.map { row -> ClipboardEntry in
-                    var entry = try JSONDecoder().decode(ClipboardEntry.self, from: row[0].bytes)
-                    if query.interval != nil && !entry.isSnippet {
-                        entry.lastCopiedAt = Date(timeIntervalSince1970: row[1].double)
-                        entry.sourceName = row[2].string
-                        entry.sourceBundleID = row[3].string.isEmpty ? nil : row[3].string
-                    }
-                    return entry
-                }
-                return HistoryPage(entries: entries, totalCount: count)
+                return (rows, count)
             }
         }
     }

@@ -1,19 +1,19 @@
 import Foundation
 
-public struct HistoryDateSection: Identifiable {
+public struct HistoryDateSection<Entry: HistoryDatedEntry>: Identifiable {
     public let id: String
     public let title: String
     public let startIndex: Int
-    public var entries: [ClipboardEntry]
+    public var entries: [Entry]
 }
 
 public enum HistoryDates {
-    public static func sections(_ entries: [ClipboardEntry], now: Date = Date(), calendar: Calendar = .current) -> [HistoryDateSection] {
+    public static func sections<Entry: HistoryDatedEntry>(_ entries: [Entry], now: Date = Date(), calendar: Calendar = .current) -> [HistoryDateSection<Entry>] {
         let today = calendar.startOfDay(for: now)
         let yesterday = calendar.date(byAdding: .day, value: -1, to: today)!
         let week = calendar.date(byAdding: .day, value: -6, to: today)!
         let month = calendar.date(byAdding: .day, value: -29, to: today)!
-        var result = [HistoryDateSection]()
+        var result = [HistoryDateSection<Entry>]()
         for (index, entry) in entries.enumerated() {
             let date = entry.displayDate
             let key: String

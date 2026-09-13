@@ -58,7 +58,7 @@ final class HistoryStore: ObservableObject {
 
     var policy: HistoryPolicy { HistoryPolicy(maximumCount: settings.maximumCount, retentionDays: settings.retentionDays) }
     var filteredEntries: [ClipboardEntry] { entries }
-    var dateSections: [HistoryDateSection] { HistoryDates.sections(entries, now: referenceDate) }
+    var dateSections: [HistoryDateSection<ClipboardEntry>] { HistoryDates.sections(entries, now: referenceDate) }
     var selected: ClipboardEntry? { isLoading ? nil : (entries.first { $0.id == selectedID } ?? entries.first) }
     var historyCount: Int { count(for: .all) - count(for: .snippets) }
     var snippetCount: Int { count(for: .snippets) }

@@ -100,7 +100,7 @@ struct DatabaseTests {
                         .integer(entry.byteCount), .null, .data(try JSONEncoder().encode(entry))])
             let upgraded = try HistoryRepository(directory: directory)
             #expect(try upgraded.page(HistoryQuery(text: "cafe notes")).entries == [entry])
-            #expect(try db.rows("PRAGMA user_version").first?.first?.double == 2)
+            #expect(try db.rows("PRAGMA user_version").first?.first?.double == 3)
             #expect(try upgraded.copyEvents(for: entry.id).isEmpty) // No invented events during the schema-only upgrade.
         }
     }
