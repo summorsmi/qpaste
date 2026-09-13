@@ -22,6 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var workspaceObserver: Any?
     private var previousApp: NSRunningApplication?
     private var pasteTask: Task<Void, Never>?
+    private var contentActionTask: Task<Void, Never>?
     private var isDemo = false
     private var displayedCompactMode = false
     private var pendingCompactMode: Bool?
@@ -299,7 +300,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showPanel(); return true }
 
-    private func copy(_ entry: ClipboardEntry, plainText: Bool) {
+    private func copy(_ item: HistoryListItem, plainText: Bool) { resolveAction(item, plainText: plainText, paste: false) }
+    private func paste(_ item: HistoryListItem, plainText: Bool) { resolveAction(item, plainText: plainText, paste: true) }
+
+    private func resolveAction(_ item: HistoryListItem, plainText: Bool, paste: Bool) {
+        guard !store.isLoading else { return }
+        let target = previousApp
+        contentActionTask?.cancel()
+        contentActionTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let entry = try await self.store.content(for: item)
+                try Task.checkCancellation()
+                if paste {
+                    guard self.panel.isKeyWindow else { return }
+                    self.pasteContent(entry, plainText: plainText, target: target)
+                } else { self.copyContent(entry, plainText: plainText) }
+            } catch is CancellationError {} catch { self.store.notify(error.localizedDescription, isError: true) }
+        }
+    }
+
+    private func copyContent(_ entry: ClipboardEntry, plainText: Bool) {
         guard !store.isLoading else { return }
         do {
             try monitor.write(entry, plainText: plainText)
@@ -307,12 +328,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         } catch { store.notify(error.localizedDescription, isError: true) }
     }
 
-    private func paste(_ entry: ClipboardEntry, plainText: Bool) {
+    private func pasteContent(_ entry: ClipboardEntry, plainText: Bool, target: NSRunningApplication?) {
         guard !store.isLoading else { return }
         do { try monitor.write(entry, plainText: plainText) }
         catch { store.notify(error.localizedDescription, isError: true); return }
         if isDemo { store.notify("演示内容已写入独立测试剪贴板"); return }
-        guard let target = previousApp, !target.isTerminated,
+        guard let target, !target.isTerminated,
               target.processIdentifier != ProcessInfo.processInfo.processIdentifier else {
             store.notify("内容已复制，未找到可粘贴的目标应用。", isError: true)
             return
@@ -390,17 +411,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if event.keyCode == 125 && !command { store.moveSelection(by: 1); return nil }
         if event.keyCode == 126 && !command { store.moveSelection(by: -1); return nil }
         if event.keyCode == 36 || event.keyCode == 76 {
-            if let entry = store.selected { paste(entry, plainText: shift) }
+            if let entry = store.selectedItem { paste(entry, plainText: shift) }
             return nil
         }
         if command, event.charactersIgnoringModifiers == "c", editing?.selectedRange().length ?? 0 == 0 {
-            if let entry = store.selected { copy(entry, plainText: shift) }
+            if let entry = store.selectedItem { copy(entry, plainText: shift) }
             return nil
         }
-        if command, event.charactersIgnoringModifiers == "d", let entry = store.selected {
+        if command, event.charactersIgnoringModifiers == "d", let entry = store.selectedItem {
             store.toggleFavorite(entry); return nil
         }
-        if command, event.keyCode == 51, let entry = store.selected { store.delete(entry); return nil }
+        if command, event.keyCode == 51, let entry = store.selectedItem { store.delete(entry); return nil }
         if command, let character = event.charactersIgnoringModifiers, let number = Int(character), (1...9).contains(number),
            store.filteredEntries.count >= number {
             paste(store.filteredEntries[number - 1], plainText: shift); return nil
@@ -412,6 +433,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         frameSaveWork?.cancel()
         rememberPanelFrame()
         pasteTask?.cancel()
+        contentActionTask?.cancel()
         monitor?.stop()
         store?.flush()
         shortcut?.stop()

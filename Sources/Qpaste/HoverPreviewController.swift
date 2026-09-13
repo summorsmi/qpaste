@@ -10,6 +10,8 @@ final class HoverPreviewController: ObservableObject {
     private(set) var panel: HoverDetailPanel?
     private weak var anchor: NSView?
     private var entryID: UUID?
+    private var entryRevision: String?
+    private var contentTask: Task<Void, Never>?
     private var showWork: DispatchWorkItem?
     private var closeWork: DispatchWorkItem?
     private var subscriptions = Set<AnyCancellable>()
@@ -42,24 +44,47 @@ final class HoverPreviewController: ObservableObject {
     }
 
     deinit {
+        contentTask?.cancel()
         showWork?.cancel()
         closeWork?.cancel()
         if let eventMonitor { NSEvent.removeMonitor(eventMonitor) }
     }
 
     func enter(_ entry: ClipboardEntry, from view: NSView, image: @escaping () -> NSImage?) {
+        enter(HistoryListItem(entry, revision: entry.fingerprint), from: view) { (entry, image()) }
+    }
+
+    func enter(_ item: HistoryListItem, from view: NSView,
+               load: @escaping @MainActor () async throws -> (ClipboardEntry, NSImage?)) {
         closeWork?.cancel()
         // Leaving cancels a pending show. Returning before the close delay must
         // start it again; only an already visible panel can be reused.
-        if anchor === view && entryID == entry.id && panel != nil { return }
+        if anchor === view && entryID == item.id && entryRevision == item.revision && panel != nil { return }
         dismiss()
         anchor = view
-        entryID = entry.id
+        entryID = item.id
+        entryRevision = item.revision
         let work = DispatchWorkItem { [weak self, weak view] in
             guard let self, let view, self.anchor === view,
                   let window = view.window, self.canPresent(window),
                   window.attachedSheet == nil, !view.visibleRect.isEmpty else { return }
-            self.present(entry, from: view, image: image())
+            self.contentTask = Task { [weak self, weak view] in
+                do {
+                    let (entry, image) = try await load()
+                    guard !Task.isCancelled, let self, let view,
+                          self.anchor === view, self.entryID == item.id, self.entryRevision == item.revision,
+                          let window = view.window, self.canPresent(window), window.attachedSheet == nil,
+                          !view.visibleRect.isEmpty else { return }
+                    self.present(entry, from: view, image: image)
+                } catch {
+                    guard !Task.isCancelled, let self, let view, self.anchor === view,
+                          let window = view.window, self.canPresent(window), window.attachedSheet == nil,
+                          !view.visibleRect.isEmpty else { return }
+                    let entry = ClipboardEntry(kind: .text, text: "详情无法读取：\(error.localizedDescription)",
+                                               sourceName: item.sourceName, now: item.displayDate)
+                    self.present(entry, from: view, image: nil)
+                }
+            }
         }
         showWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + showDelay, execute: work)
@@ -68,6 +93,7 @@ final class HoverPreviewController: ObservableObject {
     func leave(_ view: NSView) {
         guard anchor === view else { return }
         showWork?.cancel()
+        if panel == nil { contentTask?.cancel() }
         scheduleClose()
     }
 
@@ -82,6 +108,7 @@ final class HoverPreviewController: ObservableObject {
     }
 
     func dismiss() {
+        contentTask?.cancel(); contentTask = nil
         showWork?.cancel(); showWork = nil
         closeWork?.cancel(); closeWork = nil
         if let panel {
@@ -92,6 +119,7 @@ final class HoverPreviewController: ObservableObject {
         panel = nil
         anchor = nil
         entryID = nil
+        entryRevision = nil
     }
 
     private func present(_ entry: ClipboardEntry, from view: NSView, image: NSImage?) {

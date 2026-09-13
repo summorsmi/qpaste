@@ -17,8 +17,8 @@ enum Palette {
 struct MainView: View {
     @ObservedObject var store: HistoryStore
     @ObservedObject var settings: AppSettings
-    let paste: (ClipboardEntry, Bool) -> Void
-    let copy: (ClipboardEntry, Bool) -> Void
+    let paste: (HistoryListItem, Bool) -> Void
+    let copy: (HistoryListItem, Bool) -> Void
     @FocusState private var searchFocused: Bool
     @ViewState<ClipboardEntry?> private var previewImage = nil
     @ViewState<Bool> private var accessibilityEnabled = AXIsProcessTrusted()
@@ -79,6 +79,7 @@ struct MainView: View {
         .onChange(of: store.query) { _, _ in hoverPreview.dismiss() }
         .onChange(of: store.filter) { _, _ in hoverPreview.dismiss() }
         .onChange(of: store.dateFilter) { _, _ in hoverPreview.dismiss() }
+        .onChange(of: store.isLoading) { _, loading in if loading { hoverPreview.dismiss() } }
         .onChange(of: store.showSettings) { _, _ in hoverPreview.dismiss() }
         .onChange(of: store.snippetDraft?.id) { _, _ in hoverPreview.dismiss() }
         .onDisappear { hoverPreview.dismiss() }
@@ -294,7 +295,7 @@ struct MainView: View {
         }.background(Palette.surface)
     }
 
-    private func entryRow(_ entry: ClipboardEntry, index: Int) -> some View {
+    private func entryRow(_ entry: HistoryListItem, index: Int) -> some View {
         let selected = store.selectedID == entry.id
         return HStack(alignment: .top, spacing: 11) {
             Group {
@@ -347,7 +348,12 @@ struct MainView: View {
                 if store.selectedID != entry.id { store.selectedID = entry.id }
             }, activate: { paste(entry, false) }, hoverID: settings.isCompact ? entry.id : nil,
                hoverChanged: settings.isCompact ? { inside, view in
-                   if inside { hoverPreview.enter(entry, from: view, image: { store.previewImage(for: entry) }) }
+                   if inside {
+                       hoverPreview.enter(entry, from: view) {
+                           let content = try await store.content(for: entry)
+                           return (content, store.previewImage(for: entry))
+                       }
+                   }
                    else { hoverPreview.leave(view) }
                } : nil)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -369,7 +375,7 @@ struct MainView: View {
     }
 
     @ViewBuilder private var detail: some View {
-        if let entry = store.selected {
+        if let entry = store.selected, let item = store.selectedItem {
             VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 8) {
                     Image(systemName: entry.isSnippet ? "text.badge.plus" : entry.kind.symbol)
@@ -402,22 +408,26 @@ struct MainView: View {
                     }.font(.system(size: 10)).foregroundStyle(.tertiary)
                     Rectangle().fill(Palette.line).frame(height: 1)
                     HStack(spacing: 9) {
-                        Button { paste(entry, false) } label: {
+                        Button { paste(item, false) } label: {
                             HStack(spacing: 20) { Text("粘贴"); Text("↩").opacity(0.75) }
                                 .font(.system(size: 12, weight: .medium)).padding(.horizontal, 13).padding(.vertical, 9)
                         }.buttonStyle(.plain).foregroundStyle(.white).background(Palette.accent, in: RoundedRectangle(cornerRadius: 7))
                             .accessibilityLabel("粘贴选中内容")
                         if entry.kind != .image {
-                            Button { paste(entry, true) } label: {
+                            Button { paste(item, true) } label: {
                                 Text(entry.kind == .files ? "粘贴路径" : "纯文本粘贴").font(.system(size: 11)).padding(.horizontal, 10).padding(.vertical, 9)
                             }.buttonStyle(.plain).background(Palette.subtle, in: RoundedRectangle(cornerRadius: 7))
                                 .help("⇧↩ · 去掉格式后粘贴")
                         }
                         Spacer(minLength: 0)
-                        iconButton("doc.on.doc", help: "复制 · ⌘C") { copy(entry, false) }
+                        iconButton("doc.on.doc", help: "复制 · ⌘C") { copy(item, false) }
                     }
                 }.padding(27).padding(.top, 4)
             }
+        } else if store.isLoadingContent {
+            ProgressView().controlSize(.small).frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if let error = store.contentError {
+            ContentUnavailableView("详情无法读取", systemImage: "exclamationmark.circle", description: Text(error))
         } else {
             welcome
         }
@@ -496,6 +506,7 @@ struct MainView: View {
 
     @ViewBuilder private var compactNotices: some View {
         if let issue = store.storageError { compactNotice(issue) }
+        if let issue = store.contentError { compactNotice("详情无法读取：\(issue)") }
         if let issue = store.shortcutError {
             compactNotice(issue)
         } else if !accessibilityEnabled {
@@ -549,7 +560,7 @@ struct MainView: View {
             .help(help).accessibilityLabel(help)
     }
 
-    private func color(for entry: ClipboardEntry) -> Color {
+    private func color(for entry: HistoryListItem) -> Color {
         if entry.isSnippet { return .purple }
         if entry.looksLikeCode { return Color(red: 0.4, green: 0.5, blue: 0.68) }
         switch entry.kind {

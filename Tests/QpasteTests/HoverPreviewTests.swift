@@ -6,6 +6,29 @@ import QpasteCore
 @Suite("精简悬浮详情", .serialized)
 @MainActor
 struct HoverPreviewTests {
+    @Test func closingPreviewWhileBodyLoadsCannotReopenItLater() async throws {
+        _ = NSApplication.shared
+        let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 420, height: 400),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        let anchor = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
+        window.contentView = anchor; window.orderFront(nil)
+        let controller = HoverPreviewController(showDelay: 0.01, canPresent: { $0.isVisible })
+        var finish: CheckedContinuation<Void, Never>?
+        defer { finish?.resume(); controller.dismiss(); window.orderOut(nil) }
+        let entry = ClipboardEntry(kind: .text, text: "完整的异步正文")
+        controller.enter(HistoryListItem(entry), from: anchor) {
+            await withCheckedContinuation { finish = $0 }
+            return (entry, nil)
+        }
+        for _ in 0..<100 where finish == nil { try await Task.sleep(for: .milliseconds(10)) }
+        try #require(finish != nil)
+        controller.dismiss()
+        finish?.resume(); finish = nil
+        try await Task.sleep(for: .milliseconds(30))
+        #expect(controller.panel == nil)
+        #expect(window.childWindows?.isEmpty != false)
+    }
+
     @Test func returningToRowBeforeCloseDelayRestartsPendingPreview() async throws {
         _ = NSApplication.shared
         let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 420, height: 400),
@@ -19,7 +42,7 @@ struct HoverPreviewTests {
         controller.enter(entry, from: anchor, image: { nil })
         controller.leave(anchor)
         controller.enter(entry, from: anchor, image: { nil })
-        try await Task.sleep(for: .milliseconds(80))
+        try await waitForPanel(controller, visible: true)
         #expect(controller.panel?.isVisible == true)
     }
 
@@ -113,7 +136,7 @@ struct HoverPreviewTests {
         #expect(!imageLoaded)
 
         controller.enter(entry, from: anchor, image: { nil })
-        try await Task.sleep(for: .milliseconds(60))
+        try await waitForPanel(controller, visible: true)
         let preview = try #require(controller.panel)
         #expect(preview.isVisible)
         #expect(!preview.canBecomeKey && !preview.canBecomeMain)
@@ -134,7 +157,7 @@ struct HoverPreviewTests {
         try await Task.sleep(for: .milliseconds(60))
         #expect(controller.panel === preview)
         controller.pointerLeftPreview()
-        try await Task.sleep(for: .milliseconds(60))
+        try await waitForPanel(controller, visible: false)
         #expect(controller.panel == nil)
         #expect(window.childWindows?.isEmpty != false)
 
@@ -148,7 +171,7 @@ struct HoverPreviewTests {
             return true
         }
         controller.enter(ClipboardEntry(kind: .image, imageWidth: 400, imageHeight: 1400), from: anchor, image: { image })
-        try await Task.sleep(for: .milliseconds(60))
+        try await waitForPanel(controller, visible: true)
         let imagePanel = try #require(controller.panel)
         imagePanel.contentView?.layoutSubtreeIfNeeded()
         let imageScroll = try #require(descendants(of: imagePanel.contentView!).compactMap { $0 as? NSScrollView }.first)
@@ -161,6 +184,14 @@ struct HoverPreviewTests {
         #expect(imageScroll.contentView.bounds.maxY <= imageDocument.bounds.maxY + 1)
         try await Task.sleep(for: .milliseconds(60))
         try snapshot(imagePanel, named: "image-bottom")
+    }
+
+    private func waitForPanel(_ controller: HoverPreviewController, visible: Bool) async throws {
+        for _ in 0..<200 {
+            if (controller.panel != nil) == visible { return }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try #require((controller.panel != nil) == visible, "异步详情应完成显示或关闭")
     }
 
     private func descendants(of view: NSView) -> [NSView] {

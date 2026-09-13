@@ -48,7 +48,7 @@ struct ClipboardTests {
             pasteboard.setString("synthetic marked sample", forType: .string)
             pasteboard.setData(Data(), forType: .init("org.nspasteboard.ConcealedType"))
             monitor.poll()
-            #expect(store.entries.first?.text == "synthetic marked sample")
+            #expect(store.selected?.text == "synthetic marked sample")
         }
     }
 
@@ -64,7 +64,7 @@ struct ClipboardTests {
             pasteboard.clearContents()
             pasteboard.setString("after resume", forType: .string)
             monitor.poll()
-            #expect(store.entries.map(\.text) == ["after resume"])
+            #expect(store.entries.map(\.title) == ["after resume"])
         }
     }
 
@@ -76,7 +76,7 @@ struct ClipboardTests {
             pasteboard.setString(rich.string, forType: .string)
             pasteboard.setData(rtf, forType: .rtf)
             monitor.poll()
-            let entry = try #require(store.entries.first)
+            let entry = try #require(store.selected)
             #expect(entry.richText != nil)
             try monitor.write(entry, plainText: false)
             #expect(pasteboard.data(forType: .rtf) == rtf)
@@ -116,7 +116,7 @@ struct ClipboardTests {
             pasteboard.clearContents()
             pasteboard.setData(png, forType: .png)
             monitor.poll()
-            let entry = try #require(store.entries.first)
+            let entry = try #require(store.selected)
             #expect(entry.kind == .image)
             #expect(entry.imageWidth == 8 && entry.imageHeight == 6)
             #expect(store.image(for: entry) != nil)
@@ -138,7 +138,7 @@ struct ClipboardTests {
             pasteboard.clearContents()
             pasteboard.writeObjects(urls as [NSURL])
             monitor.poll()
-            let entry = try #require(store.entries.first)
+            let entry = try #require(store.selected)
             #expect(entry.kind == .files)
             #expect(entry.filePaths == urls.map(\.path))
             try monitor.write(entry, plainText: false)
@@ -165,7 +165,7 @@ struct ClipboardTests {
             #expect(store.selected?.id == original.id)
             store.clearHistory(includeFavorites: true)
             #expect(store.entries.count == 1)
-            #expect(store.entries.first?.text == "Hello again")
+            #expect(store.selected?.text == "Hello again")
             store.flush()
             #expect(try store.repository.load().first?.snippetName == "工作签名")
         }
@@ -322,9 +322,9 @@ struct ClipboardTests {
             store.flush()
             store.refreshDates(now: yesterday)
             store.dateFilter = .today
-            #expect(store.filteredEntries.map(\.text) == ["yesterday"])
+            #expect(store.filteredEntries.map(\.title) == ["yesterday"])
             store.refreshDates(now: today)
-            #expect(store.filteredEntries.map(\.text) == ["today"])
+            #expect(store.filteredEntries.map(\.title) == ["today"])
             #expect(store.historyCount == 2)
             let savedCount = try store.repository.load().count
             #expect(savedCount == 2)

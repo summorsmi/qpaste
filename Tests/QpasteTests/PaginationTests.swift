@@ -10,13 +10,14 @@ struct PaginationTests {
         try await fixture(synchronous: false) { store in
             store.selectedID = store.entries[5].id
             let selected = store.selectedID
+            try await settle(store)
             store.applyRetention()
             #expect(!store.isLoading)
             #expect(store.selected?.id == selected)
             store.query = "key299"
             store.applyRetention()
             try await settle(store)
-            #expect(store.entries.map(\.text) == ["项目 Café key299"])
+            #expect(store.entries.map(\.title) == ["项目 Café key299"])
             store.settings.maximumCount = 100
             store.applyRetention()
             try await settle(store)
@@ -68,7 +69,7 @@ struct PaginationTests {
             #expect(store.selected == nil)
             store.query = "cafe key198"
             try await settle(store)
-            #expect(store.entries.map(\.text) == ["项目 Café key198"])
+            #expect(store.entries.map(\.title) == ["项目 Café key198"])
             #expect(store.resultCount == 1)
             store.query = ""
             try await settle(store)
@@ -98,10 +99,13 @@ struct PaginationTests {
         try await fixture { store in
             let db = try SQLiteDatabase(url: store.repository.databaseURL)
             try db.execute("CREATE TRIGGER test_write_failure BEFORE INSERT ON entries BEGIN SELECT RAISE(FAIL,'test write failure'); END")
-            store.add(ClipboardEntry(kind: .text, text: "pending capture"))
-            let pending = try #require(store.entries.first { $0.text == "pending capture" })
+            let body = "pending capture\n" + String(repeating: "正文", count: 10_000) + "待保存的结尾"
+            store.add(ClipboardEntry(kind: .text, text: body))
+            let pending = try #require(store.entries.first { $0.title == "pending capture" })
             #expect(store.storageError != nil)
             #expect(try store.repository.entry(id: pending.id) == nil)
+            let unsaved = try await store.content(for: pending)
+            #expect(unsaved.text == body)
             try db.execute("DROP TRIGGER test_write_failure")
             store.applyRetention()
             #expect(store.storageError == nil)
@@ -112,9 +116,9 @@ struct PaginationTests {
 
     private func settle(_ store: HistoryStore) async throws {
         for _ in 0..<300 {
-            if !store.isLoading && !store.isLoadingMore { return }
+            if !store.isLoading && !store.isLoadingMore && !store.isLoadingContent { return }
             try await Task.sleep(for: .milliseconds(10))
         }
-        try #require(!store.isLoading && !store.isLoadingMore, "后台查询应在测试时限内完成")
+        try #require(!store.isLoading && !store.isLoadingMore && !store.isLoadingContent, "后台查询应在测试时限内完成")
     }
 }

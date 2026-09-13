@@ -57,7 +57,7 @@ struct PerformanceTests {
             if loadAll {
                 start = ProcessInfo.processInfo.systemUptime
                 while store.hasMore { autoreleasepool { store.loadMore() } }
-                report("load-all", start: start, extra: "loaded=\(store.entries.count) retainedTextMiB=\(store.entries.reduce(0) { $0 + $1.text.utf8.count } / 1_048_576)")
+                report("load-all", start: start, extra: "loaded=\(store.entries.count) summaryKiB=\(store.entries.reduce(0) { $0 + $1.title.utf8.count } / 1_024) cachedBodyKiB=\(store.cachedContentBytes / 1_024)")
             }
             start = ProcessInfo.processInfo.systemUptime
             autoreleasepool { store.add(ClipboardEntry(kind: .text, text: "new captured sample")) }
