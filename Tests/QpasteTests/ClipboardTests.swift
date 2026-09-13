@@ -241,6 +241,30 @@ struct ClipboardTests {
         }
     }
 
+    @Test func displayPreviewIsBoundedAndExplicitPreviewAndPasteKeepOriginalPixels() throws {
+        try withFixture { store, monitor, pasteboard in
+            let bitmap = try #require(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 2800, pixelsHigh: 1600,
+                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0))
+            memset(try #require(bitmap.bitmapData), 180, bitmap.bytesPerRow * bitmap.pixelsHigh)
+            let png = try #require(bitmap.representation(using: .png, properties: [:]))
+            let name = ClipboardEntry.digest(png) + ".png"
+            let entry = ClipboardEntry(kind: .image, imageFileName: name, imageWidth: 2800, imageHeight: 1600, byteCount: png.count)
+            store.add(entry, imageData: png)
+            let preview = try #require(store.previewImage(for: entry))
+            #expect(preview.size == NSSize(width: 1400, height: 800))
+            #expect(store.previewImage(for: entry) === preview)
+            let original = try #require(store.image(for: entry)?.cgImage(forProposedRect: nil, context: nil, hints: nil))
+            #expect(original.width == 2800 && original.height == 1600)
+            try monitor.write(entry, plainText: false)
+            #expect(pasteboard.data(forType: .png) == png)
+            let tall = ImageThumbnail.previewPixelSize(width: 1000, height: 16000)
+            #expect(Double(tall) * Double(tall) / 16 <= 8_000_000)
+            #expect(tall > 11000) // Long screenshots still have enough detail to scroll.
+            #expect(ImageThumbnail.previewPixelSize(width: 400, height: 200) == 400)
+        }
+    }
+
     @Test func dateFilterFindsEarlierCopyWithoutOverwritingLatestMetadata() throws {
         try withFixture { store, _, _ in
             store.settings.retentionDays = 0

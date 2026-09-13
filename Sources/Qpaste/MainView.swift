@@ -347,7 +347,7 @@ struct MainView: View {
                 if store.selectedID != entry.id { store.selectedID = entry.id }
             }, activate: { paste(entry, false) }, hoverID: settings.isCompact ? entry.id : nil,
                hoverChanged: settings.isCompact ? { inside, view in
-                   if inside { hoverPreview.enter(entry, from: view, image: { store.image(for: entry) }) }
+                   if inside { hoverPreview.enter(entry, from: view, image: { store.previewImage(for: entry) }) }
                    else { hoverPreview.leave(view) }
                } : nil)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -434,7 +434,7 @@ struct MainView: View {
                 NativeTextPreview(text: entry.text, monospaced: entry.looksLikeCode)
             }
         case .image:
-            if let image = store.image(for: entry) {
+            if let image = store.previewImage(for: entry) {
                 VStack(spacing: 13) {
                     ZStack {
                         Checkerboard()

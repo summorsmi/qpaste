@@ -36,6 +36,7 @@ final class HistoryStore: ObservableObject {
     private let ioQueue = DispatchQueue(label: "app.qpaste.persistence", qos: .utility)
     private let queryQueue = DispatchQueue(label: "app.qpaste.queries", qos: .userInitiated)
     private let images = NSCache<NSString, NSImage>()
+    private let previews = NSCache<NSString, NSImage>()
     private let thumbnails = NSCache<NSString, NSImage>()
     private var toastTask: Task<Void, Never>?
     private var dateSubscriptions = Set<AnyCancellable>()
@@ -70,6 +71,7 @@ final class HistoryStore: ObservableObject {
         repository = try HistoryRepository(directory: directory)
         queryRepository = try HistoryRepository(directory: directory)
         images.totalCostLimit = 60 * 1_024 * 1_024
+        previews.totalCostLimit = 32 * 1_024 * 1_024
         thumbnails.totalCostLimit = 12 * 1_024 * 1_024
         do { _ = try repository.summary() }
         catch {
@@ -109,7 +111,6 @@ final class HistoryStore: ObservableObject {
         }
         if let imageData, let name = incoming.imageFileName {
             if let thumbnail = ImageThumbnail.make(data: imageData) { cacheThumbnail(thumbnail, named: name) }
-            if let image = NSImage(data: imageData) { images.setObject(image, forKey: name as NSString, cost: (incoming.imageWidth ?? 1) * (incoming.imageHeight ?? 1) * 4) }
         }
         let event = incoming.isSnippet ? nil : CopyEvent(entryID: incoming.id, copiedAt: incoming.lastCopiedAt, sourceName: incoming.sourceName, sourceBundleID: incoming.sourceBundleID)
         pendingSaves.append(PendingSave(entry: incoming, imageData: imageData, event: event))
@@ -302,6 +303,21 @@ final class HistoryStore: ObservableObject {
         if let cached = images.object(forKey: name as NSString) { return cached }
         guard let url = repository.imageURL(named: name), let image = NSImage(contentsOf: url) else { return nil }
         images.setObject(image, forKey: name as NSString, cost: (entry.imageWidth ?? 1) * (entry.imageHeight ?? 1) * 4)
+        return image
+    }
+
+    func previewImage(for entry: ClipboardEntry) -> NSImage? {
+        guard let name = entry.imageFileName else { return nil }
+        if let cached = previews.object(forKey: name as NSString) { return cached }
+        let limit = ImageThumbnail.previewPixelSize(width: entry.imageWidth ?? 1, height: entry.imageHeight ?? 1)
+        let image: NSImage?
+        if let data = pendingSaves.last(where: { $0.entry.imageFileName == name })?.imageData {
+            image = ImageThumbnail.make(data: data, maximumPixelSize: limit)
+        } else if let url = repository.imageURL(named: name) {
+            image = ImageThumbnail.make(url: url, maximumPixelSize: limit)
+        } else { image = nil }
+        guard let image else { return nil }
+        previews.setObject(image, forKey: name as NSString, cost: Int(image.size.width * image.size.height) * 4)
         return image
     }
 
