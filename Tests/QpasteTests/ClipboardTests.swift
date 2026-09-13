@@ -16,7 +16,7 @@ struct ClipboardTests {
         try #require(available, "The macOS pasteboard service must be available to the test process")
         pasteboard.clearContents()
         let settings = AppSettings(defaults: defaults)
-        let store = try HistoryStore(settings: settings, directory: directory)
+        let store = try HistoryStore(settings: settings, directory: directory, synchronousQueries: true)
         let monitor = ClipboardMonitor(store: store, pasteboard: pasteboard)
         defer {
             monitor.stop()
@@ -282,7 +282,7 @@ struct ClipboardTests {
             #expect(store.filteredEntries.map(\.text) == ["yesterday"])
             store.refreshDates(now: today)
             #expect(store.filteredEntries.map(\.text) == ["today"])
-            #expect(store.entries.count == 2)
+            #expect(store.historyCount == 2)
             let savedCount = try store.repository.load().count
             #expect(savedCount == 2)
             #expect(store.settings.retentionDays == 0)

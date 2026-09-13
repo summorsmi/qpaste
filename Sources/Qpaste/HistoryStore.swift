@@ -2,18 +2,24 @@ import AppKit
 import Combine
 import QpasteCore
 
+private final class HistoryQueryToken: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+    var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
+    func cancel() { lock.lock(); cancelled = true; lock.unlock() }
+}
+
 @MainActor
 final class HistoryStore: ObservableObject {
-    @Published private(set) var entries: [ClipboardEntry] = [] {
-        didSet { usage = HistoryUsage(entries: entries) }
-    }
+    @Published private(set) var entries: [ClipboardEntry] = []
     @Published private(set) var usage = HistoryUsage()
+    @Published private(set) var resultCount = 0
+    @Published private(set) var isLoading = false
+    @Published private(set) var isLoadingMore = false
     @Published private(set) var referenceDate = Date()
-    @Published var query = "" { didSet { reconcileSelection(); selectionScrollToken += 1 } }
-    @Published var filter: HistoryFilter = .all { didSet { reconcileSelection(); selectionScrollToken += 1 } }
-    @Published var dateFilter: HistoryDateFilter = .all {
-        didSet { refreshDateMatches(); reconcileSelection(); selectionScrollToken += 1 }
-    }
+    @Published var query = "" { didSet { if oldValue != query { reload(reset: true, debounce: true) } } }
+    @Published var filter: HistoryFilter = .all { didSet { if oldValue != filter { reload(reset: true) } } }
+    @Published var dateFilter: HistoryDateFilter = .all { didSet { if oldValue != dateFilter { reload(reset: true) } } }
     @Published var selectedID: UUID?
     @Published private(set) var selectionScrollToken = 0
     @Published var toast: String?
@@ -26,44 +32,55 @@ final class HistoryStore: ObservableObject {
 
     let settings: AppSettings
     let repository: HistoryRepository
+    private let queryRepository: HistoryRepository
     private let ioQueue = DispatchQueue(label: "app.qpaste.persistence", qos: .utility)
+    private let queryQueue = DispatchQueue(label: "app.qpaste.queries", qos: .userInitiated)
     private let images = NSCache<NSString, NSImage>()
     private let thumbnails = NSCache<NSString, NSImage>()
     private var toastTask: Task<Void, Never>?
-    private var canSave = true
     private var dateSubscriptions = Set<AnyCancellable>()
-    private var dateMatches = [UUID: CopyEvent]()
-    private var matchedInterval: DateInterval?
+    private var summary = HistorySummary()
+    private var databaseEntries: [ClipboardEntry] = []
+    private var databaseCount = 0
+    private var loadedQuery = HistoryQuery()
+    private var queryToken: HistoryQueryToken?
+    private let synchronousQueries: Bool
+    static let pageSize = 80
+
+    private struct PendingSave {
+        var entry: ClipboardEntry
+        var imageData: Data?
+        var event: CopyEvent?
+    }
+    private var pendingSaves = [PendingSave]()
+    private var hadPendingWriteError = false
 
     var policy: HistoryPolicy { HistoryPolicy(maximumCount: settings.maximumCount, retentionDays: settings.retentionDays) }
-    var filteredEntries: [ClipboardEntry] {
-        entries.compactMap(entryForCurrentDateRange).filter { filter.includes($0) && $0.matches(query) }.sorted {
-            $0.displayDate == $1.displayDate ? $0.id.uuidString > $1.id.uuidString : $0.displayDate > $1.displayDate
-        }
-    }
-    var dateSections: [HistoryDateSection] { HistoryDates.sections(filteredEntries, now: referenceDate) }
-    var selected: ClipboardEntry? { filteredEntries.first { $0.id == selectedID } ?? filteredEntries.first }
-    var historyCount: Int { entries.filter { !$0.isSnippet }.count }
-    var snippetCount: Int { entries.filter(\.isSnippet).count }
+    var filteredEntries: [ClipboardEntry] { entries }
+    var dateSections: [HistoryDateSection] { HistoryDates.sections(entries, now: referenceDate) }
+    var selected: ClipboardEntry? { isLoading ? nil : (entries.first { $0.id == selectedID } ?? entries.first) }
+    var historyCount: Int { count(for: .all) - count(for: .snippets) }
+    var snippetCount: Int { count(for: .snippets) }
+    var hasMore: Bool { databaseEntries.count < databaseCount }
+    private var currentQuery: HistoryQuery { HistoryQuery(filter: filter, text: query, interval: dateFilter.interval(now: referenceDate)) }
 
-    init(settings: AppSettings, directory: URL) throws {
+    init(settings: AppSettings, directory: URL, synchronousQueries: Bool = false) throws {
         self.settings = settings
+        self.synchronousQueries = synchronousQueries
         repository = try HistoryRepository(directory: directory)
+        queryRepository = try HistoryRepository(directory: directory)
         images.totalCostLimit = 60 * 1_024 * 1_024
         thumbnails.totalCostLimit = 12 * 1_024 * 1_024
-        do {
-            entries = policy.applying(to: try repository.load())
-            selectedID = entries.first?.id
-            persist()
-        } catch {
-            do {
-                try repository.preserveUnreadableArchive()
-                storageError = "旧历史无法读取，已保留备份。新的记录仍可正常保存。"
-            } catch {
-                canSave = false
-                storageError = "无法读取或备份历史文件，暂时仅在内存中记录。请检查存储目录权限。"
-            }
+        do { _ = try repository.summary() }
+        catch {
+            guard repository.legacyImportFailed else { throw error }
+            try repository.preserveUnreadableArchive()
+            _ = try repository.summary()
+            storageError = "旧历史无法读取，已保留备份。新的记录仍可正常保存。"
         }
+        try repository.saveChanges(policy: policy)
+        let page = try queryRepository.page(limit: Self.pageSize)
+        apply(page, summary: try queryRepository.summary(), query: currentQuery, append: false, preferredID: nil)
         Timer.publish(every: 60, on: .main, in: .common).autoconnect()
             .sink { [weak self] date in self?.refreshDates(now: date) }.store(in: &dateSubscriptions)
         for name in [NSNotification.Name.NSCalendarDayChanged, .NSSystemTimeZoneDidChange, .NSSystemClockDidChange, NSApplication.didBecomeActiveNotification] {
@@ -74,121 +91,205 @@ final class HistoryStore: ObservableObject {
             .sink { [weak self] _ in self?.refreshDates() }.store(in: &dateSubscriptions)
     }
 
+    func count(for filter: HistoryFilter) -> Int { summary.counts[filter, default: 0] }
+
     func refreshDates(now: Date = Date()) {
         referenceDate = now
-        if matchedInterval != dateFilter.interval(now: now) { refreshDateMatches(); reconcileSelection() }
+        if loadedQuery.interval != currentQuery.interval { reload(reset: true) }
     }
-
-    private func entryForCurrentDateRange(_ entry: ClipboardEntry) -> ClipboardEntry? {
-        guard let range = dateFilter.interval(now: referenceDate) else { return entry }
-        if entry.isSnippet { return entry.displayDate >= range.start && entry.displayDate < range.end ? entry : nil }
-        guard let event = dateMatches[entry.id] else { return nil }
-        var result = entry
-        result.lastCopiedAt = event.copiedAt
-        result.sourceName = event.sourceName
-        result.sourceBundleID = event.sourceBundleID
-        return result
-    }
-
-    private func refreshDateMatches() {
-        matchedInterval = dateFilter.interval(now: referenceDate)
-        guard let range = matchedInterval else { dateMatches = [:]; return }
-        do { dateMatches = try ioQueue.sync { try repository.latestCopyEvents(in: range) } }
-        catch { dateMatches = [:]; storageError = "日期记录读取失败：\(error.localizedDescription)" }
-    }
-
-    func count(for filter: HistoryFilter) -> Int { entries.filter(filter.includes).count }
 
     func add(_ entry: ClipboardEntry, imageData: Data? = nil) {
-        if let imageData, let name = entry.imageFileName, let thumbnail = ImageThumbnail.make(data: imageData) {
-            cacheThumbnail(thumbnail, named: name)
+        var incoming = entry
+        let previous = pendingSaves.last { $0.entry.fingerprint == entry.fingerprint }?.entry
+            ?? (try? repository.entry(fingerprint: entry.fingerprint))
+        if let previous {
+            incoming.id = previous.id
+            incoming.createdAt = previous.createdAt
+            incoming.isFavorite = previous.isFavorite
         }
-        if let imageData, let name = entry.imageFileName, let image = NSImage(data: imageData) {
-            images.setObject(image, forKey: name as NSString, cost: (entry.imageWidth ?? 1) * (entry.imageHeight ?? 1) * 4)
+        if let imageData, let name = incoming.imageFileName {
+            if let thumbnail = ImageThumbnail.make(data: imageData) { cacheThumbnail(thumbnail, named: name) }
+            if let image = NSImage(data: imageData) { images.setObject(image, forKey: name as NSString, cost: (incoming.imageWidth ?? 1) * (incoming.imageHeight ?? 1) * 4) }
         }
-        entries = policy.inserting(entry, into: entries)
-        reconcileSelection()
-        let retained = entries.first { $0.fingerprint == entry.fingerprint }
-        let event = retained.map { CopyEvent(entryID: $0.id, copiedAt: entry.lastCopiedAt, sourceName: entry.sourceName, sourceBundleID: entry.sourceBundleID) }
-        persist(imageData: imageData, copyEvent: event)
+        let event = incoming.isSnippet ? nil : CopyEvent(entryID: incoming.id, copiedAt: incoming.lastCopiedAt, sourceName: incoming.sourceName, sourceBundleID: incoming.sourceBundleID)
+        pendingSaves.append(PendingSave(entry: incoming, imageData: imageData, event: event))
+        _ = drainPending()
+        reload()
     }
 
     func toggleFavorite(_ entry: ClipboardEntry) {
-        guard let index = entries.firstIndex(where: { $0.id == entry.id }), !entry.isSnippet else { return }
-        entries[index].isFavorite.toggle()
-        let saved = entries[index].isFavorite
-        applyRetention()
-        notify(saved ? "已加入收藏" : "已取消收藏")
+        guard !entry.isSnippet, drainPending() else { return }
+        do {
+            guard var current = try repository.entry(id: entry.id) else { return }
+            current.isFavorite.toggle()
+            let policy = policy
+            try ioQueue.sync { try repository.saveChanges(upserting: [current], policy: policy); try repository.removeUnreferencedImages() }
+            reload()
+            notify(current.isFavorite ? "已加入收藏" : "已取消收藏")
+        } catch { reportWriteError(error) }
     }
 
     func delete(_ entry: ClipboardEntry) {
-        let index = filteredEntries.firstIndex { $0.id == entry.id } ?? 0
-        entries.removeAll { $0.id == entry.id }
-        let remaining = filteredEntries
-        selectedID = remaining.isEmpty ? nil : remaining[min(index, remaining.count - 1)].id
-        selectionScrollToken += 1
-        persist()
-        notify(entry.isSnippet ? "片段已删除" : "记录已删除")
+        guard drainPending() else { return }
+        let index = entries.firstIndex { $0.id == entry.id } ?? 0
+        let remaining = entries.filter { $0.id != entry.id }
+        let preferred = remaining.isEmpty ? nil : remaining[min(index, remaining.count - 1)].id
+        do {
+            try ioQueue.sync { try repository.saveChanges(deleting: [entry.id]); try repository.removeUnreferencedImages() }
+            reload(preferredID: preferred)
+            notify(entry.isSnippet ? "片段已删除" : "记录已删除")
+        } catch { reportWriteError(error) }
     }
 
     func clearHistory(includeFavorites: Bool = false) {
-        entries.removeAll { !$0.isSnippet && (includeFavorites || !$0.isFavorite) }
-        reconcileSelection()
-        persist()
-        notify(includeFavorites ? "历史和收藏已清空，文本片段已保留" : "历史已清空，收藏和文本片段已保留")
+        guard drainPending() else { return }
+        do {
+            try ioQueue.sync { try repository.clearHistory(includeFavorites: includeFavorites); try repository.removeUnreferencedImages() }
+            reload(reset: true)
+            notify(includeFavorites ? "历史和收藏已清空，文本片段已保留" : "历史已清空，收藏和文本片段已保留")
+        } catch { reportWriteError(error) }
     }
 
     func applyRetention() {
-        entries = policy.applying(to: entries)
-        reconcileSelection()
-        persist()
+        guard drainPending() else { return }
+        let policy = policy
+        do {
+            try ioQueue.sync { try repository.saveChanges(policy: policy); try repository.removeUnreferencedImages() }
+            reload()
+        } catch { reportWriteError(error) }
     }
 
     func saveSnippet(_ draft: SnippetDraft) {
         let name = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty, !draft.body.isEmpty else { return }
-        let savedID: UUID
-        if let index = entries.firstIndex(where: { $0.id == draft.entryID && $0.isSnippet }) {
-            entries[index].text = draft.body
-            entries[index].snippetName = name
-            entries[index].byteCount = draft.body.utf8.count
-            entries[index].updatedAt = Date()
-            savedID = entries[index].id
-        } else {
-            let entry = ClipboardEntry(kind: .text, text: draft.body,
-                                       fingerprint: "snippet:\(UUID().uuidString)",
-                                       sourceName: "文本片段", snippetName: name)
-            entries.insert(entry, at: 0)
-            savedID = entry.id
-        }
+        var saved = draft.entryID.flatMap { id in pendingSaves.last { $0.entry.id == id }?.entry ?? (try? repository.entry(id: id)) }
+        if saved?.isSnippet != true { saved = nil }
+        var entry = saved ?? ClipboardEntry(kind: .text, fingerprint: "snippet:\(UUID())", sourceName: "文本片段", snippetName: name)
+        entry.text = draft.body
+        entry.snippetName = name
+        entry.byteCount = draft.body.utf8.count
+        entry.updatedAt = Date()
+        pendingSaves.append(PendingSave(entry: entry))
+        let savedToDisk = drainPending()
         query = ""
         dateFilter = .all
         filter = .snippets
-        selectedID = savedID
-        selectionScrollToken += 1
-        persist()
-        notify("文本片段已保存")
+        reload(preferredID: entry.id)
+        if savedToDisk { notify("文本片段已保存") }
     }
 
     func editSnippet(from entry: ClipboardEntry? = nil) {
         snippetDraft = SnippetDraft(entryID: entry?.isSnippet == true ? entry?.id : nil,
-                                    name: entry.map { String($0.title.prefix(40)) } ?? "",
-                                    body: entry?.text ?? "")
+                                   name: entry.map { String($0.title.prefix(40)) } ?? "", body: entry?.text ?? "")
     }
 
     func moveSelection(by delta: Int) {
-        let values = filteredEntries
-        guard !values.isEmpty else { return }
-        let current = values.firstIndex { $0.id == selectedID } ?? 0
-        selectedID = values[min(max(current + delta, 0), values.count - 1)].id
+        guard !isLoading, !entries.isEmpty else { return }
+        let current = entries.firstIndex { $0.id == selectedID } ?? 0
+        if delta > 0, current == entries.count - 1, hasMore {
+            loadMore(selectNext: true)
+            return
+        }
+        selectedID = entries[min(max(current + delta, 0), entries.count - 1)].id
         selectionScrollToken += 1
     }
 
     func reconcileSelection() {
-        if !filteredEntries.contains(where: { $0.id == selectedID }) {
-            selectedID = filteredEntries.first?.id
-            selectionScrollToken += 1
+        if !entries.contains(where: { $0.id == selectedID }) { selectedID = entries.first?.id; selectionScrollToken += 1 }
+    }
+
+    func loadMoreIfNeeded(_ entry: ClipboardEntry) {
+        guard let index = entries.firstIndex(where: { $0.id == entry.id }), index >= entries.count - 12 else { return }
+        loadMore()
+    }
+
+    func loadMore(selectNext: Bool = false) {
+        guard hasMore, !isLoading, !isLoadingMore else { return }
+        fetch(append: true, preferredID: selectNext ? nil : selectedID, selectNext: selectNext)
+    }
+
+    private func reload(reset: Bool = false, debounce: Bool = false, preferredID: UUID? = nil) {
+        fetch(append: false, reset: reset, debounce: debounce, preferredID: preferredID ?? selectedID)
+    }
+
+    private func fetch(append: Bool, reset: Bool = false, debounce: Bool = false, preferredID: UUID?, selectNext: Bool = false) {
+        queryToken?.cancel()
+        let token = HistoryQueryToken()
+        queryToken = token
+        let criteria = currentQuery
+        let selectionAtRequest = selectedID
+        let offset = append ? databaseEntries.count : 0
+        let limit = append || reset ? Self.pageSize : max(Self.pageSize, databaseEntries.count)
+        if append { isLoadingMore = true }
+        else { isLoading = true; isLoadingMore = false; if reset { entries = []; databaseEntries = []; resultCount = 0 } }
+        let reader = queryRepository
+        let work = { () throws -> (HistoryPage, HistorySummary) in
+            (try reader.page(criteria, limit: limit, offset: offset), try reader.summary())
         }
+        let accept: (Result<(HistoryPage, HistorySummary), Error>) -> Void = { [weak self] result in
+            guard let self, !token.isCancelled else { return }
+            self.isLoading = false; self.isLoadingMore = false
+            switch result {
+            case .success(let (page, summary)):
+                let selectionChanged = self.selectedID != selectionAtRequest
+                self.apply(page, summary: summary, query: criteria, append: append,
+                           preferredID: selectionChanged ? self.selectedID : (selectNext ? page.entries.first?.id : preferredID))
+                if selectNext && !selectionChanged { self.selectionScrollToken += 1 }
+            case .failure(let error): self.storageError = "历史读取失败：\(error.localizedDescription)"
+            }
+        }
+        if synchronousQueries { accept(Result { try work() }) }
+        else {
+            queryQueue.asyncAfter(deadline: .now() + (debounce ? 0.12 : 0)) {
+                guard !token.isCancelled else { return }
+                let result = Result { try work() }
+                Task { @MainActor in accept(result) }
+            }
+        }
+    }
+
+    private func apply(_ page: HistoryPage, summary: HistorySummary, query: HistoryQuery, append: Bool, preferredID: UUID?) {
+        self.summary = summary
+        usage = summary.usage
+        loadedQuery = query
+        databaseCount = page.totalCount
+        if append { databaseEntries += page.entries } else { databaseEntries = page.entries }
+        var visible = Dictionary(databaseEntries.map { ($0.id, $0) }, uniquingKeysWith: { _, new in new })
+        for pending in pendingSaves {
+            let entry = pending.entry
+            let dateMatches = query.interval.map { entry.displayDate >= $0.start && entry.displayDate < $0.end } ?? true
+            if dateMatches && query.filter.includes(entry) && entry.matches(query.text) { visible[entry.id] = entry }
+        }
+        entries = visible.values.sorted { $0.displayDate == $1.displayDate ? $0.id.uuidString > $1.id.uuidString : $0.displayDate > $1.displayDate }
+        resultCount = max(page.totalCount, entries.count)
+        if let preferredID { selectedID = preferredID }
+        reconcileSelection()
+    }
+
+    @discardableResult
+    private func drainPending() -> Bool {
+        let policy = policy
+        do {
+            while let pending = pendingSaves.first {
+                try ioQueue.sync {
+                    if let data = pending.imageData { _ = try repository.saveImage(data) }
+                    let removed = try repository.saveChanges(upserting: [pending.entry], copyEvents: pending.event.map { [$0] } ?? [], policy: policy)
+                    if removed { try repository.removeUnreferencedImages() }
+                }
+                pendingSaves.removeFirst()
+            }
+            if hadPendingWriteError { storageError = nil; hadPendingWriteError = false }
+            return true
+        } catch {
+            hadPendingWriteError = true
+            storageError = "保存失败，内容暂存在内存中，将自动重试：\(error.localizedDescription)"
+            return false
+        }
+    }
+
+    private func reportWriteError(_ error: Error) {
+        storageError = "操作未完成：\(error.localizedDescription)"
+        notify("操作未保存，请检查存储空间", isError: true)
     }
 
     func image(for entry: ClipboardEntry) -> NSImage? {
@@ -222,30 +323,7 @@ final class HistoryStore: ObservableObject {
         }
     }
 
-    private func persist(imageData: Data? = nil, copyEvent: CopyEvent? = nil) {
-        guard canSave else { return }
-        let snapshot = entries
-        let repository = repository
-        ioQueue.async { [weak self] in
-            do {
-                if let imageData { _ = try repository.saveImage(imageData) }
-                try repository.save(snapshot, copyEvent: copyEvent)
-                try repository.removeUnreferencedImages(keeping: snapshot)
-                Task { @MainActor [weak self] in
-                    guard let self, self.dateFilter.isActive else { return }
-                    self.refreshDateMatches()
-                    self.reconcileSelection()
-                    self.objectWillChange.send()
-                }
-            } catch {
-                Task { @MainActor [weak self] in
-                    self?.storageError = "保存失败：\(error.localizedDescription)。当前记录仍在内存中，请检查磁盘空间。"
-                }
-            }
-        }
-    }
-
-    func flush() { ioQueue.sync {} }
+    func flush() { _ = drainPending(); ioQueue.sync {} }
 }
 
 struct SnippetDraft: Identifiable {

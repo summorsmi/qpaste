@@ -108,7 +108,7 @@ public struct ClipboardEntry: Identifiable, Codable, Equatable, Sendable {
     }
 }
 
-public enum HistoryFilter: String, CaseIterable, Identifiable {
+public enum HistoryFilter: String, CaseIterable, Identifiable, Sendable {
     case all, favorites, snippets, text, link, image, files
     public var id: String { rawValue }
     public var title: String {

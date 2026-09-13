@@ -34,9 +34,21 @@ final class SQLiteDatabase {
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
             sqlite3_busy_timeout(handle, 3000)
             try execute("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
+            let status = sqlite3_create_function_v2(handle, "qp_matches", 3, SQLITE_UTF8 | SQLITE_DETERMINISTIC, nil, { context, _, values in
+                let query = SQLiteDatabase.valueText(values?[2])
+                let tokens = query.split(whereSeparator: \.isWhitespace)
+                let content = SQLiteDatabase.valueText(values?[0]) + "\n" + SQLiteDatabase.valueText(values?[1])
+                sqlite3_result_int(context, tokens.allSatisfy { content.localizedStandardContains(String($0)) } ? 1 : 0)
+            }, nil, nil, nil)
+            guard status == SQLITE_OK else { throw failure() }
         } catch { sqlite3_close(handle); handle = nil; throw error }
     }
     deinit { if let handle { sqlite3_close(handle) } }
+
+    private static func valueText(_ value: OpaquePointer?) -> String {
+        guard let data = sqlite3_value_text(value) else { return "" }
+        return String(decoding: UnsafeBufferPointer(start: data, count: Int(sqlite3_value_bytes(value))), as: UTF8.self)
+    }
 
     func execute(_ sql: String) throws {
         guard sqlite3_exec(handle, sql, nil, nil, nil) == SQLITE_OK else { throw failure() }
@@ -76,8 +88,8 @@ final class SQLiteDatabase {
         }
     }
 
-    func transaction<T>(_ work: () throws -> T) throws -> T {
-        try execute("BEGIN IMMEDIATE")
+    func transaction<T>(readOnly: Bool = false, _ work: () throws -> T) throws -> T {
+        try execute(readOnly ? "BEGIN" : "BEGIN IMMEDIATE")
         do { let result = try work(); try execute("COMMIT"); return result }
         catch { try? execute("ROLLBACK"); throw error }
     }

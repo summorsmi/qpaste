@@ -53,7 +53,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             store = try HistoryStore(settings: settings, directory: directory)
         } catch {
             let alert = NSAlert()
-            alert.messageText = "Qpaste 无法创建历史存储目录"
+            alert.messageText = "Qpaste 无法打开历史存储"
             alert.informativeText = error.localizedDescription
             alert.runModal()
             NSApp.terminate(nil)
@@ -300,6 +300,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showPanel(); return true }
 
     private func copy(_ entry: ClipboardEntry, plainText: Bool) {
+        guard !store.isLoading else { return }
         do {
             try monitor.write(entry, plainText: plainText)
             store.notify(plainText ? "已复制为纯文本" : "已复制，可用 ⌘V 粘贴")
@@ -307,6 +308,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func paste(_ entry: ClipboardEntry, plainText: Bool) {
+        guard !store.isLoading else { return }
         do { try monitor.write(entry, plainText: plainText) }
         catch { store.notify(error.localizedDescription, isError: true); return }
         if isDemo { store.notify("演示内容已写入独立测试剪贴板"); return }

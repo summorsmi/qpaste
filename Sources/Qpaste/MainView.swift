@@ -243,19 +243,22 @@ struct MainView: View {
             if !settings.isCompact {
                 HStack {
                     Text(store.filter.title).font(.system(size: 12, weight: .semibold))
-                    Text("\(entries.count)").font(.system(size: 10, design: .rounded)).foregroundStyle(.tertiary)
+                    Text("\(store.resultCount)").font(.system(size: 10, design: .rounded)).foregroundStyle(.tertiary)
                     Spacer()
                     Text("最近优先").font(.system(size: 10)).foregroundStyle(.tertiary)
                 }.padding(.horizontal, 20).padding(.vertical, 17)
             }
             if entries.isEmpty {
                 VStack(spacing: 10) {
-                    Image(systemName: store.query.isEmpty ? store.filter.symbol : "magnifyingglass")
-                        .font(.system(size: 26, weight: .light)).foregroundStyle(.tertiary)
-                    Text(!store.query.isEmpty ? "没有找到相关内容" : store.dateFilter.isActive ? "这段时间没有记录" : "这里还没有内容")
-                        .font(.system(size: 12)).foregroundStyle(.secondary)
-                    if !settings.isCompact && !store.query.isEmpty {
-                        Button("清除搜索") { store.query = "" }.buttonStyle(.plain).font(.system(size: 11)).foregroundStyle(Palette.accent)
+                    if store.isLoading { ProgressView().controlSize(.small) }
+                    else {
+                        Image(systemName: store.query.isEmpty ? store.filter.symbol : "magnifyingglass")
+                            .font(.system(size: 26, weight: .light)).foregroundStyle(.tertiary)
+                        Text(!store.query.isEmpty ? "没有找到相关内容" : store.dateFilter.isActive ? "这段时间没有记录" : "这里还没有内容")
+                            .font(.system(size: 12)).foregroundStyle(.secondary)
+                        if !settings.isCompact && !store.query.isEmpty {
+                            Button("清除搜索") { store.query = "" }.buttonStyle(.plain).font(.system(size: 11)).foregroundStyle(Palette.accent)
+                        }
                     }
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -266,6 +269,8 @@ struct MainView: View {
                                 Section {
                                     ForEach(Array(section.entries.enumerated()), id: \.element.id) { offset, entry in
                                         entryRow(entry, index: section.startIndex + offset).id(entry.id)
+                                            .allowsHitTesting(!store.isLoading)
+                                            .onAppear { store.loadMoreIfNeeded(entry) }
                                     }
                                 } header: {
                                     HStack {
@@ -277,6 +282,7 @@ struct MainView: View {
                                         .accessibilityAddTraits(.isHeader)
                                 }
                             }
+                            if store.isLoadingMore { ProgressView().controlSize(.small).padding(8) }
                         }.padding(.horizontal, settings.isCompact ? 6 : 9)
                             .padding(.top, settings.isCompact ? 4 : 0).padding(.bottom, settings.isCompact ? 4 : 12)
                     }

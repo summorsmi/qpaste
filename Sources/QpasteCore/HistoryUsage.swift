@@ -16,4 +16,10 @@ public struct HistoryUsage: Equatable, Sendable {
             else { historyBytes += bytes }
         }
     }
+
+    public init(historyBytes: Int, favoriteBytes: Int, snippetBytes: Int) {
+        self.historyBytes = historyBytes
+        self.favoriteBytes = favoriteBytes
+        self.snippetBytes = snippetBytes
+    }
 }
