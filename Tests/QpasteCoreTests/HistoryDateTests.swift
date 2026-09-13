@@ -53,4 +53,18 @@ struct HistoryDateTests {
         let future = ClipboardEntry(kind: .text, text: "future", now: now.addingTimeInterval(86400))
         #expect(HistoryDates.sections([future], now: now, calendar: calendar).first?.title != "今天")
     }
+
+    @Test func dateFiltersIncludeWholeEndpointDaysAcrossDST() {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "America/Los_Angeles")!
+        let day = cal.date(from: DateComponents(year: 2026, month: 3, day: 8, hour: 12))!
+        let custom = HistoryDateFilter.custom(start: day, end: day).interval(now: day, calendar: cal)!
+        #expect(custom.duration == 23 * 3600)
+        #expect(custom == HistoryDateFilter.today.interval(now: day, calendar: cal))
+        let seven = HistoryDateFilter.last7Days.interval(now: day, calendar: cal)!
+        #expect(cal.dateComponents([.day], from: seven.start, to: seven.end).day == 7)
+        #expect(HistoryDateFilter.all.interval(now: day, calendar: cal) == nil)
+        let invalid = HistoryDateFilter.custom(start: day.addingTimeInterval(86400 * 3), end: day).interval(now: day, calendar: cal)!
+        #expect(invalid.duration == 0)
+    }
 }

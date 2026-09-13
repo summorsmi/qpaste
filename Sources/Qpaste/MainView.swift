@@ -23,6 +23,7 @@ struct MainView: View {
     @ViewState<ClipboardEntry?> private var previewImage = nil
     @ViewState<Bool> private var accessibilityEnabled = AXIsProcessTrusted()
     @StateObject private var hoverPreview = HoverPreviewController()
+    @ViewState<Bool> private var showDateRange = false
 
     var body: some View {
         HStack(spacing: 0) {
@@ -30,6 +31,7 @@ struct MainView: View {
             Rectangle().fill(Palette.line).frame(width: 1)
             VStack(spacing: 0) {
                 searchBar
+                if store.dateFilter.isActive { activeDateRange }
                 Rectangle().fill(Palette.line).frame(height: 1)
                 if settings.isCompact {
                     historyList.frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -68,11 +70,15 @@ struct MainView: View {
         .sheet(item: $previewImage) { entry in
             if let image = store.image(for: entry) { ImagePreview(image: image, entry: entry) }
         }
+        .sheet(isPresented: $showDateRange) {
+            DateRangeEditor(selection: store.dateFilter) { store.dateFilter = $0 }
+        }
         .onChange(of: store.focusSearchToken) { _, _ in searchFocused = true }
         .onAppear { searchFocused = true; accessibilityEnabled = AXIsProcessTrusted() }
         .onChange(of: settings.isCompact) { _, _ in accessibilityEnabled = AXIsProcessTrusted(); hoverPreview.dismiss() }
         .onChange(of: store.query) { _, _ in hoverPreview.dismiss() }
         .onChange(of: store.filter) { _, _ in hoverPreview.dismiss() }
+        .onChange(of: store.dateFilter) { _, _ in hoverPreview.dismiss() }
         .onChange(of: store.showSettings) { _, _ in hoverPreview.dismiss() }
         .onChange(of: store.snippetDraft?.id) { _, _ in hoverPreview.dismiss() }
         .onDisappear { hoverPreview.dismiss() }
@@ -190,6 +196,20 @@ struct MainView: View {
                 KeyCap(text: "⌘ F")
                 Rectangle().fill(Palette.line).frame(width: 1, height: 20).padding(.horizontal, 4)
             }
+            Menu {
+                ForEach([HistoryDateFilter.all, .today, .last7Days, .last30Days], id: \.title) { range in
+                    Button { store.dateFilter = range } label: {
+                        if store.dateFilter == range { Label(range.title, systemImage: "checkmark") }
+                        else { Text(range.title) }
+                    }
+                }
+                Divider()
+                Button("自定义日期…") { showDateRange = true }
+            } label: {
+                Image(systemName: "calendar").font(.system(size: 14)).frame(width: 24, height: 26)
+                    .foregroundStyle(store.dateFilter.isActive ? Palette.accent : Color.secondary)
+            }.menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                .help("按日期筛选").accessibilityLabel("按日期筛选")
             Button { store.editSnippet() } label: {
                 Image(systemName: "plus").font(.system(size: 14, weight: .medium)).frame(width: 24, height: 26)
             }.buttonStyle(.plain).foregroundStyle(.secondary)
@@ -203,6 +223,18 @@ struct MainView: View {
         }
         .padding(.horizontal, settings.isCompact ? 13 : 26)
         .padding(.top, 8).padding(.bottom, settings.isCompact ? 8 : 10)
+    }
+
+    private var activeDateRange: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "calendar")
+            Text(store.dateFilter.title).lineLimit(1)
+            Spacer(minLength: 4)
+            Button { store.dateFilter = .all } label: {
+                Image(systemName: "xmark.circle.fill")
+            }.buttonStyle(.plain).help("清除日期筛选").accessibilityLabel("清除日期筛选")
+        }.font(.system(size: 11)).foregroundStyle(Palette.accent)
+            .padding(.horizontal, settings.isCompact ? 13 : 26).padding(.bottom, 8)
     }
 
     private var historyList: some View {
@@ -220,7 +252,7 @@ struct MainView: View {
                 VStack(spacing: 10) {
                     Image(systemName: store.query.isEmpty ? store.filter.symbol : "magnifyingglass")
                         .font(.system(size: 26, weight: .light)).foregroundStyle(.tertiary)
-                    Text(store.query.isEmpty ? "这里还没有内容" : "没有找到相关内容")
+                    Text(!store.query.isEmpty ? "没有找到相关内容" : store.dateFilter.isActive ? "这段时间没有记录" : "这里还没有内容")
                         .font(.system(size: 12)).foregroundStyle(.secondary)
                     if !settings.isCompact && !store.query.isEmpty {
                         Button("清除搜索") { store.query = "" }.buttonStyle(.plain).font(.system(size: 11)).foregroundStyle(Palette.accent)

@@ -240,4 +240,52 @@ struct ClipboardTests {
             #expect(restored.pixelsWide == 800 && restored.pixelsHigh == 400)
         }
     }
+
+    @Test func dateFilterFindsEarlierCopyWithoutOverwritingLatestMetadata() throws {
+        try withFixture { store, _, _ in
+            store.settings.retentionDays = 0
+            let today = Date()
+            let yesterday = Calendar.current.date(byAdding: .day, value: -1, to: today)!
+            store.add(ClipboardEntry(kind: .text, text: "same content", sourceName: "Earlier App", now: yesterday))
+            store.add(ClipboardEntry(kind: .text, text: "same content", sourceName: "Latest App", now: today))
+            store.flush()
+            #expect(store.entries.count == 1)
+            let id = try #require(store.entries.first?.id)
+            store.dateFilter = .custom(start: yesterday, end: yesterday)
+            store.query = "earlier"
+            let oldCopy = try #require(store.selected)
+            #expect(oldCopy.id == id)
+            #expect(oldCopy.lastCopiedAt == yesterday)
+            store.toggleFavorite(oldCopy)
+            store.flush()
+            let persisted = try #require(store.repository.load().first)
+            #expect(persisted.lastCopiedAt == today)
+            #expect(persisted.sourceName == "Latest App")
+            #expect(persisted.isFavorite)
+            #expect(try store.repository.copyEvents(for: id).count == 2)
+            store.dateFilter = .all
+            store.query = ""
+            #expect(store.selected?.lastCopiedAt == today)
+        }
+    }
+
+    @Test func relativeDateFilterRefreshesAtMidnightAndDoesNotCleanHistory() throws {
+        try withFixture { store, _, _ in
+            store.settings.retentionDays = 0
+            let today = Date()
+            let yesterday = Calendar.current.date(byAdding: .day, value: -1, to: today)!
+            store.add(ClipboardEntry(kind: .text, text: "yesterday", now: yesterday))
+            store.add(ClipboardEntry(kind: .text, text: "today", now: today))
+            store.flush()
+            store.refreshDates(now: yesterday)
+            store.dateFilter = .today
+            #expect(store.filteredEntries.map(\.text) == ["yesterday"])
+            store.refreshDates(now: today)
+            #expect(store.filteredEntries.map(\.text) == ["today"])
+            #expect(store.entries.count == 2)
+            let savedCount = try store.repository.load().count
+            #expect(savedCount == 2)
+            #expect(store.settings.retentionDays == 0)
+        }
+    }
 }

@@ -11,6 +11,9 @@ final class HistoryStore: ObservableObject {
     @Published private(set) var referenceDate = Date()
     @Published var query = "" { didSet { reconcileSelection(); selectionScrollToken += 1 } }
     @Published var filter: HistoryFilter = .all { didSet { reconcileSelection(); selectionScrollToken += 1 } }
+    @Published var dateFilter: HistoryDateFilter = .all {
+        didSet { refreshDateMatches(); reconcileSelection(); selectionScrollToken += 1 }
+    }
     @Published var selectedID: UUID?
     @Published private(set) var selectionScrollToken = 0
     @Published var toast: String?
@@ -29,10 +32,12 @@ final class HistoryStore: ObservableObject {
     private var toastTask: Task<Void, Never>?
     private var canSave = true
     private var dateSubscriptions = Set<AnyCancellable>()
+    private var dateMatches = [UUID: CopyEvent]()
+    private var matchedInterval: DateInterval?
 
     var policy: HistoryPolicy { HistoryPolicy(maximumCount: settings.maximumCount, retentionDays: settings.retentionDays) }
     var filteredEntries: [ClipboardEntry] {
-        entries.filter { filter.includes($0) && $0.matches(query) }.sorted {
+        entries.compactMap(entryForCurrentDateRange).filter { filter.includes($0) && $0.matches(query) }.sorted {
             $0.displayDate == $1.displayDate ? $0.id.uuidString > $1.id.uuidString : $0.displayDate > $1.displayDate
         }
     }
@@ -69,7 +74,28 @@ final class HistoryStore: ObservableObject {
             .sink { [weak self] _ in self?.refreshDates() }.store(in: &dateSubscriptions)
     }
 
-    func refreshDates(now: Date = Date()) { referenceDate = now }
+    func refreshDates(now: Date = Date()) {
+        referenceDate = now
+        if matchedInterval != dateFilter.interval(now: now) { refreshDateMatches(); reconcileSelection() }
+    }
+
+    private func entryForCurrentDateRange(_ entry: ClipboardEntry) -> ClipboardEntry? {
+        guard let range = dateFilter.interval(now: referenceDate) else { return entry }
+        if entry.isSnippet { return entry.displayDate >= range.start && entry.displayDate < range.end ? entry : nil }
+        guard let event = dateMatches[entry.id] else { return nil }
+        var result = entry
+        result.lastCopiedAt = event.copiedAt
+        result.sourceName = event.sourceName
+        result.sourceBundleID = event.sourceBundleID
+        return result
+    }
+
+    private func refreshDateMatches() {
+        matchedInterval = dateFilter.interval(now: referenceDate)
+        guard let range = matchedInterval else { dateMatches = [:]; return }
+        do { dateMatches = try ioQueue.sync { try repository.latestCopyEvents(in: range) } }
+        catch { dateMatches = [:]; storageError = "日期记录读取失败：\(error.localizedDescription)" }
+    }
 
     func count(for filter: HistoryFilter) -> Int { entries.filter(filter.includes).count }
 
@@ -136,6 +162,7 @@ final class HistoryStore: ObservableObject {
             savedID = entry.id
         }
         query = ""
+        dateFilter = .all
         filter = .snippets
         selectedID = savedID
         selectionScrollToken += 1
@@ -204,6 +231,12 @@ final class HistoryStore: ObservableObject {
                 if let imageData { _ = try repository.saveImage(imageData) }
                 try repository.save(snapshot, copyEvent: copyEvent)
                 try repository.removeUnreferencedImages(keeping: snapshot)
+                Task { @MainActor [weak self] in
+                    guard let self, self.dateFilter.isActive else { return }
+                    self.refreshDateMatches()
+                    self.reconcileSelection()
+                    self.objectWillChange.send()
+                }
             } catch {
                 Task { @MainActor [weak self] in
                     self?.storageError = "保存失败：\(error.localizedDescription)。当前记录仍在内存中，请检查磁盘空间。"
