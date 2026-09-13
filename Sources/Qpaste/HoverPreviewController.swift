@@ -49,7 +49,9 @@ final class HoverPreviewController: ObservableObject {
 
     func enter(_ entry: ClipboardEntry, from view: NSView, image: @escaping () -> NSImage?) {
         closeWork?.cancel()
-        if anchor === view && entryID == entry.id { return }
+        // Leaving cancels a pending show. Returning before the close delay must
+        // start it again; only an already visible panel can be reused.
+        if anchor === view && entryID == entry.id && panel != nil { return }
         dismiss()
         anchor = view
         entryID = entry.id

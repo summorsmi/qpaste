@@ -6,6 +6,23 @@ import QpasteCore
 @Suite("精简悬浮详情", .serialized)
 @MainActor
 struct HoverPreviewTests {
+    @Test func returningToRowBeforeCloseDelayRestartsPendingPreview() async throws {
+        _ = NSApplication.shared
+        let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 420, height: 400),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        let anchor = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
+        window.contentView = anchor
+        window.orderFront(nil)
+        let controller = HoverPreviewController(showDelay: 0.02, closeDelay: 0.2, canPresent: { $0.isVisible })
+        defer { controller.dismiss(); window.orderOut(nil) }
+        let entry = ClipboardEntry(kind: .text, text: "悬浮详情往返检查")
+        controller.enter(entry, from: anchor, image: { nil })
+        controller.leave(anchor)
+        controller.enter(entry, from: anchor, image: { nil })
+        try await Task.sleep(for: .milliseconds(80))
+        #expect(controller.panel?.isVisible == true)
+    }
+
     @Test func shortAndLongTextRespectSizeBounds() {
         let small = HoverPreviewLayout.text("你好", monospaced: false)
         #expect(small.size == HoverPreviewLayout.minimumSize)
