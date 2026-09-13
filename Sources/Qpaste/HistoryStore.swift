@@ -8,6 +8,7 @@ final class HistoryStore: ObservableObject {
         didSet { usage = HistoryUsage(entries: entries) }
     }
     @Published private(set) var usage = HistoryUsage()
+    @Published private(set) var referenceDate = Date()
     @Published var query = "" { didSet { reconcileSelection(); selectionScrollToken += 1 } }
     @Published var filter: HistoryFilter = .all { didSet { reconcileSelection(); selectionScrollToken += 1 } }
     @Published var selectedID: UUID?
@@ -27,9 +28,15 @@ final class HistoryStore: ObservableObject {
     private let thumbnails = NSCache<NSString, NSImage>()
     private var toastTask: Task<Void, Never>?
     private var canSave = true
+    private var dateSubscriptions = Set<AnyCancellable>()
 
     var policy: HistoryPolicy { HistoryPolicy(maximumCount: settings.maximumCount, retentionDays: settings.retentionDays) }
-    var filteredEntries: [ClipboardEntry] { entries.filter { filter.includes($0) && $0.matches(query) } }
+    var filteredEntries: [ClipboardEntry] {
+        entries.filter { filter.includes($0) && $0.matches(query) }.sorted {
+            $0.displayDate == $1.displayDate ? $0.id.uuidString > $1.id.uuidString : $0.displayDate > $1.displayDate
+        }
+    }
+    var dateSections: [HistoryDateSection] { HistoryDates.sections(filteredEntries, now: referenceDate) }
     var selected: ClipboardEntry? { filteredEntries.first { $0.id == selectedID } ?? filteredEntries.first }
     var historyCount: Int { entries.filter { !$0.isSnippet }.count }
     var snippetCount: Int { entries.filter(\.isSnippet).count }
@@ -52,7 +59,17 @@ final class HistoryStore: ObservableObject {
                 storageError = "无法读取或备份历史文件，暂时仅在内存中记录。请检查存储目录权限。"
             }
         }
+        Timer.publish(every: 60, on: .main, in: .common).autoconnect()
+            .sink { [weak self] date in self?.refreshDates(now: date) }.store(in: &dateSubscriptions)
+        for name in [NSNotification.Name.NSCalendarDayChanged, .NSSystemTimeZoneDidChange, .NSSystemClockDidChange, NSApplication.didBecomeActiveNotification] {
+            NotificationCenter.default.publisher(for: name)
+                .sink { [weak self] _ in self?.refreshDates() }.store(in: &dateSubscriptions)
+        }
+        NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)
+            .sink { [weak self] _ in self?.refreshDates() }.store(in: &dateSubscriptions)
     }
+
+    func refreshDates(now: Date = Date()) { referenceDate = now }
 
     func count(for filter: HistoryFilter) -> Int { entries.filter(filter.includes).count }
 

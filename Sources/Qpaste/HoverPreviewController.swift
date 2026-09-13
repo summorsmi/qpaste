@@ -190,7 +190,7 @@ private struct HoverDetailContent: View {
             HStack(spacing: 8) {
                 Text(entry.sourceName).lineLimit(1).help(entry.sourceName)
                 Spacer(minLength: 0)
-                Text(entry.lastCopiedAt.formatted(date: .numeric, time: .standard)).fixedSize()
+                Text((entry.isSnippet ? "修改于 " : "复制于 ") + entry.displayDate.formatted(date: .numeric, time: .standard)).fixedSize()
             }.font(.system(size: 10)).foregroundStyle(.secondary).padding(.horizontal, 14).padding(.vertical, 8)
         }
         .frame(width: layout.size.width, height: layout.size.height)

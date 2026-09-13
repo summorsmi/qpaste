@@ -230,8 +230,20 @@ struct MainView: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(spacing: settings.isCompact ? 2 : 5) {
-                            ForEach(Array(entries.enumerated()), id: \.element.id) { index, entry in
-                                entryRow(entry, index: index).id(entry.id)
+                            ForEach(store.dateSections) { section in
+                                Section {
+                                    ForEach(Array(section.entries.enumerated()), id: \.element.id) { offset, entry in
+                                        entryRow(entry, index: section.startIndex + offset).id(entry.id)
+                                    }
+                                } header: {
+                                    HStack {
+                                        Text(section.title).font(.system(size: 10, weight: .medium))
+                                        Spacer()
+                                    }.foregroundStyle(.secondary)
+                                        .padding(.horizontal, settings.isCompact ? 10 : 12)
+                                        .padding(.top, 8).padding(.bottom, 3)
+                                        .accessibilityAddTraits(.isHeader)
+                                }
                             }
                         }.padding(.horizontal, settings.isCompact ? 6 : 9)
                             .padding(.top, settings.isCompact ? 4 : 0).padding(.bottom, settings.isCompact ? 4 : 12)
@@ -280,7 +292,7 @@ struct MainView: View {
                     }
                     Text(entry.sourceName).lineLimit(1)
                     Text("·")
-                    Text(timeLabel(entry.lastCopiedAt)).lineLimit(1)
+                    Text((entry.isSnippet ? "修改于 " : "") + timeLabel(entry.displayDate)).lineLimit(1)
                     Spacer(minLength: 0)
                     if entry.isFavorite && store.filter != .all { Image(systemName: "star.fill").foregroundStyle(Palette.accent).font(.system(size: 9)) }
                     if !settings.isCompact && selected && index < 9 { Text("⌘\(index + 1)").font(.system(size: 9, design: .monospaced)) }
@@ -342,6 +354,8 @@ struct MainView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
 
                 VStack(alignment: .leading, spacing: 16) {
+                    Text((entry.isSnippet ? "修改于 " : "复制于 ") + entry.displayDate.formatted(date: .numeric, time: .standard))
+                        .font(.system(size: 10)).foregroundStyle(.tertiary)
                     HStack(spacing: 6) {
                         Image(systemName: entry.isSnippet ? "text.badge.plus" : "app.dashed")
                         Text(entry.sourceName)
