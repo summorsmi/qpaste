@@ -5,7 +5,7 @@
     <key>CFBundleName</key><string>Qpaste</string>
     <key>CFBundleDisplayName</key><string>Qpaste</string>
     <key>CFBundleIdentifier</key><string>app.qpaste.mac</string>
-    <key>CFBundleVersion</key><string>2</string>
+    <key>CFBundleVersion</key><string>3</string>
     <key>CFBundleShortVersionString</key><string>1.0</string>
     <key>CFBundleExecutable</key><string>Qpaste</string>
     <key>CFBundlePackageType</key><string>APPL</string>
