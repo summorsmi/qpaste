@@ -6,6 +6,25 @@ import Testing
 @Suite("分页与后台查询", .serialized)
 @MainActor
 struct PaginationTests {
+    @Test func noOpRetentionDoesNotInterruptSelectionOrAnActiveSearch() async throws {
+        try await fixture(synchronous: false) { store in
+            store.selectedID = store.entries[5].id
+            let selected = store.selectedID
+            store.applyRetention()
+            #expect(!store.isLoading)
+            #expect(store.selected?.id == selected)
+            store.query = "key299"
+            store.applyRetention()
+            try await settle(store)
+            #expect(store.entries.map(\.text) == ["项目 Café key299"])
+            store.settings.maximumCount = 100
+            store.applyRetention()
+            try await settle(store)
+            #expect(store.entries.isEmpty)
+            #expect(store.historyCount == 100)
+        }
+    }
+
     private func fixture(synchronous: Bool = true, _ body: (HistoryStore) async throws -> Void) async throws {
         let name = "qpaste-pagination-\(UUID())"
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(name)

@@ -151,11 +151,16 @@ final class HistoryStore: ObservableObject {
     }
 
     func applyRetention() {
+        let hadPendingSaves = !pendingSaves.isEmpty
         guard drainPending() else { return }
         let policy = policy
         do {
-            try ioQueue.sync { try repository.saveChanges(policy: policy); try repository.removeUnreferencedImages() }
-            reload()
+            let removed = try ioQueue.sync {
+                let removed = try repository.saveChanges(policy: policy)
+                try repository.removeUnreferencedImages()
+                return removed
+            }
+            if removed || hadPendingSaves { reload() }
         } catch { reportWriteError(error) }
     }
 
