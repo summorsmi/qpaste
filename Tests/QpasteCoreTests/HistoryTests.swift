@@ -145,6 +145,16 @@ struct HistoryTests {
         #expect(try repository.load() == [entry])
     }
 
+    @Test func longTextSummaryKeepsUnicodeLineAndCodeSemantics() {
+        let body = "\n\r\n" + String(repeating: "👩🏽‍💻你好", count: 200) + "\n正文末尾"
+        let entry = ClipboardEntry(kind: .text, text: body)
+        #expect(entry.title == String(String(repeating: "👩🏽‍💻你好", count: 200).prefix(160)))
+        #expect(entry.text == body)
+        #expect(ClipboardEntry(kind: .text, text: "\r\n\n").title == "空白文本")
+        #expect(ClipboardEntry(kind: .text, text: "   \nlet value = 1\n").looksLikeCode)
+        #expect(!ClipboardEntry(kind: .text, text: "ordinary text\nlet value = 1").looksLikeCode)
+    }
+
     private func temporaryDirectory() -> URL {
         FileManager.default.temporaryDirectory.appendingPathComponent("qpaste-core-tests-\(UUID().uuidString)")
     }

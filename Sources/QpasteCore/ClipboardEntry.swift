@@ -76,13 +76,15 @@ public struct ClipboardEntry: Identifiable, Codable, Equatable, Sendable {
             let first = filePaths.first.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "文件"
             return filePaths.count > 1 ? "\(first) 等 \(filePaths.count) 个文件" : first
         case .text, .link:
-            return String(text.split(whereSeparator: \.isNewline).first.map(String.init)?.prefix(160) ?? "空白文本")
+            // List rows need only a short prefix, including for multi-megabyte clips.
+            let line = String(text.lazy.drop(while: \.isNewline).prefix(while: { !$0.isNewline }).prefix(160))
+            return line.isEmpty ? "空白文本" : line
         }
     }
 
     public var looksLikeCode: Bool {
         guard kind == .text else { return false }
-        let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let value = text.drop(while: \.isWhitespace)
         return value.hasPrefix("{") || value.hasPrefix("[") || value.hasPrefix("<")
             || ["func ", "const ", "import ", "def ", "SELECT ", "#!/", "let ", "function ", "class "]
                 .contains(where: value.hasPrefix)
