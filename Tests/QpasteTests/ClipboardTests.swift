@@ -17,7 +17,7 @@ struct ClipboardTests {
         pasteboard.clearContents()
         let settings = AppSettings(defaults: defaults)
         let store = try HistoryStore(settings: settings, directory: directory, synchronousQueries: true)
-        let monitor = ClipboardMonitor(store: store, pasteboard: pasteboard)
+        let monitor = ClipboardMonitor(store: store, pasteboard: pasteboard, synchronousCapture: true)
         defer {
             monitor.stop()
             store.flush()

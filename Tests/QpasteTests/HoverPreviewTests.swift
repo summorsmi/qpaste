@@ -58,6 +58,32 @@ struct HoverPreviewTests {
         #expect(oneLine.size.height == 480)
     }
 
+    @Test func optimizedTextSizingMatchesOriginalDimensions() {
+        let samples = ["你好", String(repeating: "短行\n", count: 80),
+                       String(repeating: "复制文字 abcde\n", count: 500),
+                       String(repeating: "👩🏽‍💻é\n", count: 800),
+                       String(repeating: "x", count: 2_000), String(repeating: "x", count: 2_001)]
+        for monospaced in [false, true] {
+            for text in samples {
+                let maximum = NSSize(width: 450, height: 390)
+                let paragraph = NSMutableParagraphStyle(); paragraph.lineSpacing = 6
+                let attributes: [NSAttributedString.Key: Any] = [
+                    .font: monospaced ? NSFont.monospacedSystemFont(ofSize: 12, weight: .regular) : NSFont.systemFont(ofSize: 14),
+                    .paragraphStyle: paragraph]
+                let sample = String(text.prefix(2_000))
+                let measured = (sample as NSString).boundingRect(with: NSSize(width: 422, height: CGFloat.greatestFiniteMagnitude),
+                    options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: attributes)
+                let width = min(450, max(280, ceil(measured.width) + 28))
+                let wrapped = (sample as NSString).boundingRect(with: NSSize(width: width - 28, height: CGFloat.greatestFiniteMagnitude),
+                    options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: attributes)
+                let height = sample.utf16.count < text.utf16.count ? 390 : ceil(wrapped.height) + 100
+                let expected = NSSize(width: width, height: min(390, max(140, height)))
+                #expect(HoverPreviewLayout.text(text, monospaced: monospaced, maximum: maximum).size == expected)
+                #expect(HoverPreviewLayout.text(text, monospaced: monospaced, maximum: maximum).size == expected)
+            }
+        }
+    }
+
     @Test func imagesKeepAspectRatioAndTallImagesExtendBeyondViewport() {
         let small = HoverPreviewLayout.image(width: 30, height: 20)
         #expect(small.size == HoverPreviewLayout.minimumSize)

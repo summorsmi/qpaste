@@ -1,6 +1,11 @@
 import Foundation
 import CSQLite
 
+private final class SearchTerms {
+    let tokens: [String]
+    init(_ query: String) { tokens = query.split(whereSeparator: \.isWhitespace).map(String.init) }
+}
+
 enum SQLValue {
     case text(String), number(Double), integer(Int), data(Data), null
     var string: String { if case .text(let value) = self { return value }; return "" }
@@ -35,10 +40,17 @@ final class SQLiteDatabase {
             sqlite3_busy_timeout(handle, 3000)
             try execute("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
             let status = sqlite3_create_function_v2(handle, "qp_matches", 3, SQLITE_UTF8 | SQLITE_DETERMINISTIC, nil, { context, _, values in
-                let query = SQLiteDatabase.valueText(values?[2])
-                let tokens = query.split(whereSeparator: \.isWhitespace)
+                let terms: SearchTerms
+                if let cached = sqlite3_get_auxdata(context, 2) {
+                    terms = Unmanaged<SearchTerms>.fromOpaque(cached).takeUnretainedValue()
+                } else {
+                    terms = SearchTerms(SQLiteDatabase.valueText(values?[2]))
+                    sqlite3_set_auxdata(context, 2, Unmanaged.passRetained(terms).toOpaque()) { pointer in
+                        if let pointer { Unmanaged<SearchTerms>.fromOpaque(pointer).release() }
+                    }
+                }
                 let content = SQLiteDatabase.valueText(values?[0]) + "\n" + SQLiteDatabase.valueText(values?[1])
-                sqlite3_result_int(context, tokens.allSatisfy { content.localizedStandardContains(String($0)) } ? 1 : 0)
+                sqlite3_result_int(context, terms.tokens.allSatisfy { content.localizedStandardContains($0) } ? 1 : 0)
             }, nil, nil, nil)
             guard status == SQLITE_OK else { throw failure() }
         } catch { sqlite3_close(handle); handle = nil; throw error }
@@ -85,6 +97,24 @@ final class SQLiteDatabase {
                 default: return .null
                 }
             })
+        }
+    }
+
+    func withCancellation<T>(_ token: HistoryQueryCancellation?, _ work: () throws -> T) throws -> T {
+        guard let token else { return try work() }
+        try token.check()
+        sqlite3_progress_handler(handle, 256, { context in
+            guard let context else { return 0 }
+            return Unmanaged<HistoryQueryCancellation>.fromOpaque(context).takeUnretainedValue().isCancelled ? 1 : 0
+        }, Unmanaged.passUnretained(token).toOpaque())
+        defer { sqlite3_progress_handler(handle, 0, nil, nil); withExtendedLifetime(token) {} }
+        do {
+            let result = try work()
+            try token.check()
+            return result
+        } catch {
+            if token.isCancelled { throw CancellationError() }
+            throw error
         }
     }
 

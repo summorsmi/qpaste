@@ -26,6 +26,14 @@ enum ImageThumbnail {
         return NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
     }
 
+    static func fullImage(data: Data?, url: URL) -> NSImage? {
+        let source = data.map { CGImageSourceCreateWithData($0 as CFData, nil) }
+            ?? CGImageSourceCreateWithURL(url as CFURL, nil)
+        guard let source, let image = CGImageSourceCreateImageAtIndex(source, 0,
+            [kCGImageSourceShouldCacheImmediately: true] as CFDictionary) else { return nil }
+        return NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
+    }
+
     // Inline and hover previews need screen-sized pixels. Keep tall screenshots
     // readable while bounding each decoded preview to about 32 MB at four bytes/pixel.
     static func previewPixelSize(width: Int, height: Int) -> Int {

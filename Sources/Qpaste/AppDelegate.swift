@@ -351,24 +351,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 try Task.checkCancellation()
                 if paste {
                     guard self.panel.isKeyWindow else { return }
-                    self.pasteContent(entry, plainText: plainText, target: target)
-                } else { self.copyContent(entry, plainText: plainText) }
+                    await self.pasteContent(entry, plainText: plainText, target: target)
+                } else { await self.copyContent(entry, plainText: plainText) }
             } catch is CancellationError {} catch { self.store.notify(error.localizedDescription, isError: true) }
         }
     }
 
-    private func copyContent(_ entry: ClipboardEntry, plainText: Bool) {
+    private func copyContent(_ entry: ClipboardEntry, plainText: Bool) async {
         guard !store.isLoading else { return }
         do {
-            try monitor.write(entry, plainText: plainText)
+            try await monitor.writeAsync(entry, plainText: plainText)
             store.notify(plainText ? "已复制为纯文本" : "已复制，可用 ⌘V 粘贴")
-        } catch { store.notify(error.localizedDescription, isError: true) }
+        } catch is CancellationError {} catch { store.notify(error.localizedDescription, isError: true) }
     }
 
-    private func pasteContent(_ entry: ClipboardEntry, plainText: Bool, target: NSRunningApplication?) {
+    private func pasteContent(_ entry: ClipboardEntry, plainText: Bool, target: NSRunningApplication?) async {
         guard !store.isLoading else { return }
-        do { try monitor.write(entry, plainText: plainText) }
+        do { try await monitor.writeAsync(entry, plainText: plainText) }
+        catch is CancellationError { return }
         catch { store.notify(error.localizedDescription, isError: true); return }
+        guard panel.isKeyWindow else { return }
         if isDemo { store.notify("演示内容已写入独立测试剪贴板"); return }
         guard let target, !target.isTerminated,
               target.processIdentifier != ProcessInfo.processInfo.processIdentifier else {

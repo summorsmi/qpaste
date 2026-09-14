@@ -5,14 +5,28 @@ import QpasteCore
 struct CapturedClipboard {
     var entry: ClipboardEntry
     var imageData: Data?
+    var thumbnail: NSImage?
+}
+
+struct ClipboardSnapshot {
+    enum Payload { case files([String]), image(Data), text(String?, Data?) }
+    let payload: Payload
+    let sourceName: String
+    let sourceBundleID: String?
+    let date: Date
+}
+
+struct ClipboardImageData {
+    let png: Data
+    let tiff: Data?
 }
 
 @MainActor
 final class ClipboardMonitor {
     static let restoredType = NSPasteboard.PasteboardType("app.qpaste.restored")
     static let sourceType = NSPasteboard.PasteboardType("org.nspasteboard.source")
-    static let maximumTextBytes = 2 * 1_024 * 1_024
-    static let maximumImageBytes = 20 * 1_024 * 1_024
+    nonisolated static let maximumTextBytes = 2 * 1_024 * 1_024
+    nonisolated static let maximumImageBytes = 20 * 1_024 * 1_024
 
     let pasteboard: NSPasteboard
     private let store: HistoryStore
@@ -20,9 +34,17 @@ final class ClipboardMonitor {
     private var changeCount: Int
     private var wasPaused: Bool
     private var ticks = 0
+    private let captureQueue = DispatchQueue(label: "app.qpaste.capture", qos: .userInitiated)
+    private let pasteQueue = DispatchQueue(label: "app.qpaste.image-paste", qos: .userInitiated)
+    private let completions = CaptureCompletions()
+    private let synchronousCapture: Bool
+    private let decode: (ClipboardSnapshot) throws -> CapturedClipboard?
 
-    init(store: HistoryStore, pasteboard: NSPasteboard = .general) {
+    init(store: HistoryStore, pasteboard: NSPasteboard = .general, synchronousCapture: Bool = false,
+         decode: @escaping (ClipboardSnapshot) throws -> CapturedClipboard? = ClipboardMonitor.decodeSnapshot) {
         self.store = store
+        self.synchronousCapture = synchronousCapture
+        self.decode = decode
         self.pasteboard = pasteboard
         changeCount = pasteboard.changeCount
         wasPaused = store.settings.isPaused
@@ -35,7 +57,12 @@ final class ClipboardMonitor {
         if let timer { RunLoop.main.add(timer, forMode: .common) }
     }
 
-    func stop() { timer?.invalidate(); timer = nil }
+    func stop() {
+        timer?.invalidate(); timer = nil
+        // Captures accepted before termination must reach disk before store.flush().
+        captureQueue.sync {}
+        completions.drain()
+    }
 
     func resetBaseline() {
         changeCount = pasteboard.changeCount
@@ -54,17 +81,40 @@ final class ClipboardMonitor {
         let observedCount = changeCount
         let source = NSWorkspace.shared.frontmostApplication
         do {
-            if let captured = try Self.capture(from: pasteboard, sourceName: source?.localizedName ?? "未知应用",
-                                                sourceBundleID: source?.bundleIdentifier),
-               pasteboard.changeCount == observedCount {
-                store.add(captured.entry, imageData: captured.imageData)
+            guard let snapshot = try Self.readSnapshot(from: pasteboard, sourceName: source?.localizedName ?? "未知应用",
+                                                       sourceBundleID: source?.bundleIdentifier),
+                  pasteboard.changeCount == observedCount else { return }
+            if synchronousCapture {
+                if let captured = try decode(snapshot) {
+                    store.add(captured.entry, imageData: captured.imageData, thumbnail: captured.thumbnail)
+                }
+                return
             }
-        } catch {
-            store.notify(error.localizedDescription, isError: true)
-        }
+            let write = store.makeCaptureWriter()
+            let decode = decode, completions = completions
+            captureQueue.async { [weak self] in
+                autoreleasepool {
+                    do {
+                        let accept = write(try decode(snapshot))
+                        completions.append(accept)
+                        DispatchQueue.main.async { completions.drain() }
+                    } catch {
+                        let discard = write(nil)
+                        completions.append { discard(); self?.store.notify(error.localizedDescription, isError: true) }
+                        DispatchQueue.main.async { completions.drain() }
+                    }
+                }
+            }
+        } catch { store.notify(error.localizedDescription, isError: true) }
     }
 
     static func capture(from pasteboard: NSPasteboard, sourceName: String, sourceBundleID: String?) throws -> CapturedClipboard? {
+        guard let snapshot = try readSnapshot(from: pasteboard, sourceName: sourceName, sourceBundleID: sourceBundleID) else { return nil }
+        return try decodeSnapshot(snapshot)
+    }
+
+    private static func readSnapshot(from pasteboard: NSPasteboard, sourceName: String, sourceBundleID: String?) throws -> ClipboardSnapshot? {
+        let date = Date()
         let types = (pasteboard.types ?? []).map(\.rawValue)
         let originalSource = pasteboard.string(forType: sourceType)
         let bundleID = originalSource?.isEmpty == false ? originalSource : sourceBundleID
@@ -74,41 +124,49 @@ final class ClipboardMonitor {
            let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: originalSource) {
             name = FileManager.default.displayName(atPath: appURL.path).replacingOccurrences(of: ".app", with: "")
         }
-
+        let payload: ClipboardSnapshot.Payload
         if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
-            let paths = urls.map(\.path)
-            let encoded = try JSONEncoder().encode(paths)
-            return CapturedClipboard(entry: ClipboardEntry(kind: .files, text: paths.joined(separator: "\n"),
-                filePaths: paths, byteCount: encoded.count,
-                fingerprint: ClipboardEntry.digest(Data("files:".utf8) + encoded), sourceName: name, sourceBundleID: bundleID))
+            payload = .files(urls.map(\.path))
+        } else if (types.contains(NSPasteboard.PasteboardType.png.rawValue) || types.contains(NSPasteboard.PasteboardType.tiff.rawValue)),
+                  let data = pasteboard.data(forType: .png) ?? pasteboard.data(forType: .tiff) {
+            guard data.count <= maximumImageBytes else { throw CaptureError.imageTooLarge }
+            payload = .image(data)
+        } else {
+            payload = .text(pasteboard.string(forType: .string) ?? pasteboard.string(forType: .URL), pasteboard.data(forType: .rtf))
         }
-
-        // Prefer a real image representation over text fallbacks emitted by browsers.
-        if types.contains(NSPasteboard.PasteboardType.png.rawValue) || types.contains(NSPasteboard.PasteboardType.tiff.rawValue) {
-            if let sourceData = pasteboard.data(forType: .png) ?? pasteboard.data(forType: .tiff) {
-                guard sourceData.count <= maximumImageBytes else { throw CaptureError.imageTooLarge }
-                guard let source = CGImageSourceCreateWithData(sourceData as CFData, nil),
-                      let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
-                      let width = properties[kCGImagePropertyPixelWidth] as? Int,
-                      let height = properties[kCGImagePropertyPixelHeight] as? Int,
-                      width > 0, height > 0, width <= 16_384, height <= 16_384,
-                      width * height <= 40_000_000 else { throw CaptureError.imageTooLarge }
-                guard let bitmap = NSBitmapImageRep(data: sourceData),
-                      let png = bitmap.representation(using: .png, properties: [:]) else { return nil }
-                guard png.count <= maximumImageBytes else { throw CaptureError.imageTooLarge }
-                let fingerprint = ClipboardEntry.digest(png)
-                return CapturedClipboard(entry: ClipboardEntry(kind: .image,
-                    imageFileName: fingerprint + ".png", imageWidth: width, imageHeight: height,
-                    byteCount: png.count, fingerprint: "image:" + fingerprint, sourceName: name, sourceBundleID: bundleID), imageData: png)
-            }
-        }
-
-        let richData = pasteboard.data(forType: .rtf)
-        let plainText = pasteboard.string(forType: .string) ?? pasteboard.string(forType: .URL)
-        return try captureText(plainText, richData: richData, sourceName: name, sourceBundleID: bundleID)
+        return ClipboardSnapshot(payload: payload, sourceName: name, sourceBundleID: bundleID, date: date)
     }
 
-    static func captureText(_ plainText: String?, richData: Data?, sourceName: String, sourceBundleID: String?) throws -> CapturedClipboard? {
+    nonisolated static func decodeSnapshot(_ snapshot: ClipboardSnapshot) throws -> CapturedClipboard? {
+        switch snapshot.payload {
+        case .files(let paths):
+            let encoded = try JSONEncoder().encode(paths)
+            return CapturedClipboard(entry: ClipboardEntry(kind: .files, text: paths.joined(separator: "\n"),
+                filePaths: paths, byteCount: encoded.count, fingerprint: ClipboardEntry.digest(Data("files:".utf8) + encoded),
+                sourceName: snapshot.sourceName, sourceBundleID: snapshot.sourceBundleID, now: snapshot.date))
+        case .image(let data):
+            guard data.count <= maximumImageBytes else { throw CaptureError.imageTooLarge }
+            guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+                  let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+                  let width = properties[kCGImagePropertyPixelWidth] as? Int,
+                  let height = properties[kCGImagePropertyPixelHeight] as? Int,
+                  width > 0, height > 0, width <= 16_384, height <= 16_384,
+                  width * height <= 40_000_000 else { throw CaptureError.imageTooLarge }
+            guard let bitmap = NSBitmapImageRep(data: data),
+                  let png = bitmap.representation(using: .png, properties: [:]) else { return nil }
+            guard png.count <= maximumImageBytes else { throw CaptureError.imageTooLarge }
+            let fingerprint = ClipboardEntry.digest(png)
+            return CapturedClipboard(entry: ClipboardEntry(kind: .image,
+                imageFileName: fingerprint + ".png", imageWidth: width, imageHeight: height,
+                byteCount: png.count, fingerprint: "image:" + fingerprint,
+                sourceName: snapshot.sourceName, sourceBundleID: snapshot.sourceBundleID, now: snapshot.date),
+                imageData: png, thumbnail: ImageThumbnail.make(data: png))
+        case .text(let text, let rich):
+            return try captureText(text, richData: rich, sourceName: snapshot.sourceName, sourceBundleID: snapshot.sourceBundleID, now: snapshot.date)
+        }
+    }
+
+    nonisolated static func captureText(_ plainText: String?, richData: Data?, sourceName: String, sourceBundleID: String?, now: Date = Date()) throws -> CapturedClipboard? {
         let richText = richData.flatMap { $0.count <= maximumTextBytes ? $0 : nil }
         // Avoid parsing an unbounded RTF document just to extract a small body.
         if plainText == nil, richData != nil, richText == nil { throw CaptureError.richTextTooLarge }
@@ -120,10 +178,33 @@ final class ClipboardMonitor {
         let kind = ClipboardEntry.kind(for: text)
         let fingerprint = ClipboardEntry.digest(Data((kind.rawValue + ":" + text).utf8) + (rtf ?? Data()))
         return CapturedClipboard(entry: ClipboardEntry(kind: kind, text: text, richText: rtf,
-            fingerprint: fingerprint, sourceName: sourceName, sourceBundleID: sourceBundleID))
+            fingerprint: fingerprint, sourceName: sourceName, sourceBundleID: sourceBundleID, now: now))
     }
 
-    func write(_ entry: ClipboardEntry, plainText: Bool) throws {
+    func writeAsync(_ entry: ClipboardEntry, plainText: Bool) async throws {
+        try Task.checkCancellation()
+        guard entry.kind == .image && !plainText else {
+            try Task.checkCancellation()
+            try write(entry, plainText: plainText)
+            return
+        }
+        store.flush()
+        guard let name = entry.imageFileName, let url = store.repository.imageURL(named: name) else { throw CaptureError.missingImage }
+        let prepared: ClipboardImageData = try await withCheckedThrowingContinuation { continuation in
+            pasteQueue.async {
+                continuation.resume(with: Result { try autoreleasepool { try Self.imageDataForPaste(url) } })
+            }
+        }
+        try Task.checkCancellation()
+        try write(entry, plainText: false, preparedImage: prepared)
+    }
+
+    nonisolated private static func imageDataForPaste(_ url: URL) throws -> ClipboardImageData {
+        guard let png = try? Data(contentsOf: url) else { throw CaptureError.missingImage }
+        return ClipboardImageData(png: png, tiff: NSBitmapImageRep(data: png)?.tiffRepresentation)
+    }
+
+    func write(_ entry: ClipboardEntry, plainText: Bool, preparedImage: ClipboardImageData? = nil) throws {
         let item = NSPasteboardItem()
         if plainText || entry.kind == .text || entry.kind == .link {
             guard entry.kind != .image else { throw CaptureError.noText }
@@ -132,10 +213,10 @@ final class ClipboardMonitor {
             if !plainText, entry.kind == .link { item.setString(entry.text.trimmingCharacters(in: .whitespacesAndNewlines), forType: .URL) }
         } else if entry.kind == .image {
             store.flush()
-            guard let name = entry.imageFileName, let url = store.repository.imageURL(named: name),
-                  let data = try? Data(contentsOf: url) else { throw CaptureError.missingImage }
-            item.setData(data, forType: .png)
-            if let bitmap = NSBitmapImageRep(data: data), let tiff = bitmap.tiffRepresentation { item.setData(tiff, forType: .tiff) }
+            guard let name = entry.imageFileName, let url = store.repository.imageURL(named: name) else { throw CaptureError.missingImage }
+            let data = try preparedImage ?? Self.imageDataForPaste(url)
+            item.setData(data.png, forType: .png)
+            if let tiff = data.tiff { item.setData(tiff, forType: .tiff) }
         } else if entry.kind == .files {
             let urls = entry.filePaths.map { URL(fileURLWithPath: $0) }
             guard urls.allSatisfy({ FileManager.default.fileExists(atPath: $0.path) }) else { throw CaptureError.missingFile }

@@ -310,8 +310,8 @@ extension HistoryRepository {
         }
     }
 
-    public func page(_ query: HistoryQuery = HistoryQuery(), limit: Int = 80, offset: Int = 0) throws -> HistoryPage {
-        let result = try pageRows(query, limit: limit, offset: offset, column: "payload")
+    public func page(_ query: HistoryQuery = HistoryQuery(), limit: Int = 80, offset: Int = 0, cancellation: HistoryQueryCancellation? = nil) throws -> HistoryPage {
+        let result = try pageRows(query, limit: limit, offset: offset, column: "payload", cancellation: cancellation)
         let entries = try result.rows.map { row -> ClipboardEntry in
             var entry = try JSONDecoder().decode(ClipboardEntry.self, from: row[0].bytes)
             if query.interval != nil && !entry.isSnippet {
@@ -324,8 +324,8 @@ extension HistoryRepository {
         return HistoryPage(entries: entries, totalCount: result.totalCount)
     }
 
-    public func listPage(_ query: HistoryQuery = HistoryQuery(), limit: Int = 80, offset: Int = 0) throws -> HistoryListPage {
-        let result = try pageRows(query, limit: limit, offset: offset, column: "list_payload")
+    public func listPage(_ query: HistoryQuery = HistoryQuery(), limit: Int = 80, offset: Int = 0, cancellation: HistoryQueryCancellation? = nil) throws -> HistoryListPage {
+        let result = try pageRows(query, limit: limit, offset: offset, column: "list_payload", cancellation: cancellation)
         let entries = try result.rows.map { row -> HistoryListItem in
             var item = try JSONDecoder().decode(HistoryListItem.self, from: row[0].bytes)
             if query.interval != nil && !item.isSnippet {
@@ -338,45 +338,64 @@ extension HistoryRepository {
         return HistoryListPage(entries: entries, totalCount: result.totalCount)
     }
 
-    private func pageRows(_ query: HistoryQuery, limit: Int, offset: Int, column: String) throws -> (rows: [[SQLValue]], totalCount: Int) {
+    private func pageRows(_ query: HistoryQuery, limit: Int, offset: Int, column: String, cancellation: HistoryQueryCancellation?) throws -> (rows: [[SQLValue]], totalCount: Int) {
         try withDatabase { db in
-            try db.transaction(readOnly: true) {
-                var values = [SQLValue]()
-                let base: String
-                if let range = query.interval {
-                    base = """
-                        WITH matching AS (
-                            SELECT entry_id,MAX(copied_at) AS at FROM copy_events WHERE copied_at>=? AND copied_at<? GROUP BY entry_id
-                        ), candidates AS (
-                            SELECT e.id,e.kind,e.is_favorite,e.is_snippet,e.search_text,e.\(column) AS content,CASE WHEN e.is_snippet=1 THEN e.display_at ELSE m.at END AS sort_at,
-                                CASE WHEN e.is_snippet=1 THEN e.source_name ELSE
-                                    (SELECT source_name FROM copy_events WHERE entry_id=e.id AND copied_at=m.at ORDER BY id DESC LIMIT 1) END AS matched_source,
-                                CASE WHEN e.is_snippet=1 THEN e.source_bundle ELSE
-                                    (SELECT source_bundle FROM copy_events WHERE entry_id=e.id AND copied_at=m.at ORDER BY id DESC LIMIT 1) END AS matched_bundle
-                            FROM entries e LEFT JOIN matching m ON e.id=m.entry_id
-                            WHERE (e.is_snippet=0 AND m.entry_id IS NOT NULL) OR (e.is_snippet=1 AND e.display_at>=? AND e.display_at<?)
-                        )
-                        """
-                    values = [.number(range.start.timeIntervalSince1970), .number(range.end.timeIntervalSince1970),
-                              .number(range.start.timeIntervalSince1970), .number(range.end.timeIntervalSince1970)]
-                } else {
-                    base = "WITH candidates AS (SELECT id,kind,is_favorite,is_snippet,search_text,\(column) AS content,display_at AS sort_at,source_name AS matched_source,source_bundle AS matched_bundle FROM entries)"
+            try db.withCancellation(cancellation) {
+                try db.transaction(readOnly: true) {
+                    var values = [SQLValue]()
+                    let base: String
+                    if let range = query.interval {
+                        base = """
+                            WITH matching AS (
+                                SELECT entry_id,MAX(copied_at) AS at FROM copy_events WHERE copied_at>=? AND copied_at<? GROUP BY entry_id
+                            ), candidates AS (
+                                SELECT e.id,e.kind,e.is_favorite,e.is_snippet,e.search_text,e.\(column) AS content,CASE WHEN e.is_snippet=1 THEN e.display_at ELSE m.at END AS sort_at,
+                                    CASE WHEN e.is_snippet=1 THEN e.source_name ELSE
+                                        (SELECT source_name FROM copy_events WHERE entry_id=e.id AND copied_at=m.at ORDER BY id DESC LIMIT 1) END AS matched_source,
+                                    CASE WHEN e.is_snippet=1 THEN e.source_bundle ELSE
+                                        (SELECT source_bundle FROM copy_events WHERE entry_id=e.id AND copied_at=m.at ORDER BY id DESC LIMIT 1) END AS matched_bundle
+                                FROM entries e LEFT JOIN matching m ON e.id=m.entry_id
+                                WHERE (e.is_snippet=0 AND m.entry_id IS NOT NULL) OR (e.is_snippet=1 AND e.display_at>=? AND e.display_at<?)
+                            )
+                            """
+                        values = [.number(range.start.timeIntervalSince1970), .number(range.end.timeIntervalSince1970),
+                                  .number(range.start.timeIntervalSince1970), .number(range.end.timeIntervalSince1970)]
+                    } else {
+                        base = "WITH candidates AS (SELECT id,kind,is_favorite,is_snippet,search_text,\(column) AS content,display_at AS sort_at,source_name AS matched_source,source_bundle AS matched_bundle FROM entries)"
+                    }
+                    var predicate = "1=1"
+                    switch query.filter {
+                    case .all: break
+                    case .favorites: predicate += " AND is_snippet=0 AND is_favorite=1"
+                    case .snippets: predicate += " AND is_snippet=1"
+                    default: predicate += " AND is_snippet=0 AND kind=?"; values.append(.text(query.filter.rawValue))
+                    }
+                    if !query.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        predicate += " AND qp_matches(search_text,matched_source,?)=1"
+                        values.append(.text(query.text))
+                    }
+                    if !query.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        // Materialize only matching IDs and date context, never all bodies.
+                        // COUNT and pagination share one match pass, even for an empty page.
+                        let sql = base + """
+                            , matched AS MATERIALIZED (
+                                SELECT id,sort_at,matched_source,matched_bundle FROM candidates WHERE \(predicate)
+                            ), selected_page AS (
+                                SELECT * FROM matched ORDER BY sort_at DESC,id DESC LIMIT ? OFFSET ?
+                            ), total AS (SELECT COUNT(*) AS n FROM matched)
+                            SELECT e.\(column),p.sort_at,p.matched_source,p.matched_bundle,total.n
+                            FROM total LEFT JOIN selected_page p ON 1=1 LEFT JOIN entries e ON e.id=p.id
+                            ORDER BY p.sort_at DESC,p.id DESC
+                            """
+                        let rows = try db.rows(sql, values + [.integer(max(1, limit)), .integer(max(0, offset))])
+                        let count = Int(rows.first?[4].double ?? 0)
+                        return (rows.filter { if case .null = $0[0] { return false }; return true }, count)
+                    }
+                    let count = Int(try db.rows(base + " SELECT COUNT(*) FROM candidates WHERE " + predicate, values).first?.first?.double ?? 0)
+                    let rows = try db.rows(base + " SELECT content,sort_at,matched_source,matched_bundle FROM candidates WHERE " + predicate + " ORDER BY sort_at DESC,id DESC LIMIT ? OFFSET ?",
+                                           values + [.integer(max(1, limit)), .integer(max(0, offset))])
+                    return (rows, count)
                 }
-                var predicate = "1=1"
-                switch query.filter {
-                case .all: break
-                case .favorites: predicate += " AND is_snippet=0 AND is_favorite=1"
-                case .snippets: predicate += " AND is_snippet=1"
-                default: predicate += " AND is_snippet=0 AND kind=?"; values.append(.text(query.filter.rawValue))
-                }
-                if !query.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    predicate += " AND qp_matches(search_text,matched_source,?)=1"
-                    values.append(.text(query.text))
-                }
-                let count = Int(try db.rows(base + " SELECT COUNT(*) FROM candidates WHERE " + predicate, values).first?.first?.double ?? 0)
-                let rows = try db.rows(base + " SELECT content,sort_at,matched_source,matched_bundle FROM candidates WHERE " + predicate + " ORDER BY sort_at DESC,id DESC LIMIT ? OFFSET ?",
-                                       values + [.integer(max(1, limit)), .integer(max(0, offset))])
-                return (rows, count)
             }
         }
     }

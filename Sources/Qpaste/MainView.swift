@@ -74,7 +74,7 @@ struct MainView: View {
         .sheet(item: $store.snippetDraft) { draft in
             SnippetEditor(draft: draft) { store.saveSnippet($0) }
         }
-        .sheet(item: $previewImage) { entry in
+        .sheet(item: $previewImage, onDismiss: { store.releaseFullImage() }) { entry in
             if let image = store.image(for: entry) { ImagePreview(image: image, entry: entry) }
         }
         .sheet(isPresented: $showDateRange) {
@@ -358,7 +358,7 @@ struct MainView: View {
                    if inside {
                        hoverPreview.enter(entry, from: view) {
                            let content = try await store.content(for: entry)
-                           return (content, store.previewImage(for: entry))
+                           return (content, try await store.loadPreviewImage(for: entry))
                        }
                    }
                    else { hoverPreview.leave(view) }
@@ -482,6 +482,8 @@ struct MainView: View {
                             .font(.system(size: 10)).foregroundStyle(.secondary)
                     }.buttonStyle(.plain)
                 }
+            } else if store.isLoadingPreview(for: entry) {
+                Color.clear
             } else {
                 ContentUnavailableView("图片无法读取", systemImage: "photo.badge.exclamationmark")
             }

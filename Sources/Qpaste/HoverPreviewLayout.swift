@@ -10,9 +10,28 @@ struct HoverPreviewLayout {
     let size: NSSize
     let imageSize: NSSize?
 
-    static func text(_ text: String, monospaced: Bool, maximum: NSSize = maximumSize) -> Self {
+    private struct TextKey: Hashable {
+        let sample: String
+        let truncated: Bool
+        let monospaced: Bool
+        let width: CGFloat
+        let height: CGFloat
+    }
+    @MainActor private static var textLayouts: [TextKey: (layout: Self, used: UInt64)] = [:]
+    @MainActor private static var clock: UInt64 = 0
+
+    @MainActor static func text(_ text: String, monospaced: Bool, maximum: NSSize = maximumSize) -> Self {
         let maxWidth = max(1, min(maximum.width, maximumSize.width))
         let maxHeight = max(1, min(maximum.height, maximumSize.height))
+        let prefix = text.prefix(2_000)
+        let sample = String(prefix)
+        let truncated = prefix.endIndex != text.endIndex
+        let key = TextKey(sample: sample, truncated: truncated, monospaced: monospaced, width: maxWidth, height: maxHeight)
+        clock &+= 1
+        if let cached = textLayouts[key] {
+            textLayouts[key] = (cached.layout, clock)
+            return cached.layout
+        }
         let paragraph = NSMutableParagraphStyle()
         paragraph.lineSpacing = 6
         let attributes: [NSAttributedString.Key: Any] = [
@@ -20,16 +39,24 @@ struct HoverPreviewLayout {
             .paragraphStyle: paragraph
         ]
         // Only sizing is bounded. The preview's scroll view receives the full text.
-        let sample = String(text.prefix(2_000))
         let measured = (sample as NSString).boundingRect(
             with: NSSize(width: max(1, maxWidth - contentPadding), height: .greatestFiniteMagnitude),
             options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: attributes)
         let width = min(maxWidth, max(minimumSize.width, ceil(measured.width) + contentPadding))
-        let wrapped = (sample as NSString).boundingRect(
-            with: NSSize(width: max(1, width - contentPadding), height: .greatestFiniteMagnitude),
-            options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: attributes)
-        let height = sample.utf16.count < text.utf16.count ? maxHeight : ceil(wrapped.height) + chromeHeight + 8
-        return Self(size: NSSize(width: width, height: min(maxHeight, max(minimumSize.height, height))), imageSize: nil)
+        let height: CGFloat
+        if truncated { height = maxHeight }
+        else {
+            let wrapped = (sample as NSString).boundingRect(
+                with: NSSize(width: max(1, width - contentPadding), height: .greatestFiniteMagnitude),
+                options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: attributes)
+            height = ceil(wrapped.height) + chromeHeight + 8
+        }
+        let layout = Self(size: NSSize(width: width, height: min(maxHeight, max(minimumSize.height, height))), imageSize: nil)
+        if textLayouts.count >= 32, let oldest = textLayouts.min(by: { $0.value.used < $1.value.used })?.key {
+            textLayouts.removeValue(forKey: oldest)
+        }
+        textLayouts[key] = (layout, clock)
+        return layout
     }
 
     static func image(width: Int, height: Int, maximum: NSSize = maximumSize) -> Self {

@@ -33,6 +33,52 @@ struct PerformanceTests {
         }
     }
 
+    @Test func optimizedPreviewAndCaptureMeasurements() async throws {
+        let text = String(repeating: "复制文字 abcde\n", count: 100_000)
+        var start = ProcessInfo.processInfo.systemUptime
+        _ = HoverPreviewLayout.text(text, monospaced: false)
+        report("hover-layout-cold", start: start)
+        start = ProcessInfo.processInfo.systemUptime
+        _ = HoverPreviewLayout.text(text, monospaced: false)
+        report("hover-layout-cached", start: start)
+
+        let name = "qpaste-async-performance-\(UUID())"
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        let defaults = UserDefaults(suiteName: name)!
+        let settings = AppSettings(defaults: defaults)
+        settings.maximumCount = 0; settings.retentionDays = 0
+        let store = try HistoryStore(settings: settings, directory: directory)
+        let board = NSPasteboard(name: .init(name))
+        let monitor = ClipboardMonitor(store: store, pasteboard: board)
+        defer {
+            monitor.stop(); store.flush(); board.releaseGlobally()
+            defaults.removePersistentDomain(forName: name); try? FileManager.default.removeItem(at: directory)
+        }
+        let png = try autoreleasepool {
+            let bitmap = try #require(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 6000, pixelsHigh: 4000,
+                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0))
+            memset(try #require(bitmap.bitmapData), 180, bitmap.bytesPerRow * bitmap.pixelsHigh)
+            return try #require(bitmap.representation(using: .png, properties: [:]))
+        }
+        board.clearContents(); board.setData(png, forType: .png)
+        start = ProcessInfo.processInfo.systemUptime
+        monitor.poll()
+        report("image-capture-main-return", start: start)
+        for _ in 0..<1000 {
+            if store.entries.count == 1 && !store.isLoading && !store.isLoadingContent { break }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        let item = try #require(store.selectedItem)
+        report("image-capture-total", start: start)
+        start = ProcessInfo.processInfo.systemUptime
+        _ = store.previewImage(for: item)
+        report("image-preview-main-return", start: start)
+        let image = try await store.loadPreviewImage(for: item)
+        #expect(image != nil)
+        report("image-preview-async-total", start: start)
+    }
+
     private func measureHistory(count: Int, textBytes: Int, loadAll: Bool) throws {
         try fixture { repository, settings in
             let now = Date()
