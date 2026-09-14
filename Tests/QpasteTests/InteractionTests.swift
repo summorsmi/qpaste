@@ -1,10 +1,105 @@
 import AppKit
+import SwiftUI
 import Testing
 @testable import Qpaste
 
 @Suite("窗口尺寸与鼠标选择", .serialized)
 @MainActor
 struct InteractionTests {
+    @Test func hostingKeepsMinimumBoundsAcrossAttachmentAndModeChanges() async throws {
+        _ = NSApplication.shared
+        let name = "qpaste-minimum-\(UUID())"
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        let defaults = UserDefaults(suiteName: name)!
+        defer { defaults.removePersistentDomain(forName: name); try? FileManager.default.removeItem(at: directory) }
+        let settings = AppSettings(defaults: defaults)
+        settings.isCompact = true
+        let store = try HistoryStore(settings: settings, directory: directory, synchronousQueries: true)
+        let panel = ClipboardPanel(contentRect: NSRect(x: 0, y: 0, width: 560, height: 430),
+                                   styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
+        panel.titleVisibility = .hidden
+        panel.titlebarAppearsTransparent = true
+        panel.minSize = PanelSizing.minimumContentSize(compact: true)
+        let hosting = PanelSizing.hostingView(rootView: MainView(store: store, settings: settings, paste: { _, _ in }, copy: { _, _ in }))
+        panel.contentView = hosting
+        panel.orderFront(nil)
+        defer { panel.orderOut(nil); panel.contentView = nil }
+        panel.contentView?.layoutSubtreeIfNeeded()
+        try await waitForMinimum(panel, compact: true)
+        panel.setFrame(PanelSizing.restoredFrame(panel.frame,
+            minimum: PanelSizing.minimumFrameSize(for: panel, compact: true), visibleFrame: nil), display: false)
+        let compactSize = PanelSizing.minimumFrameSize(for: panel, compact: true)
+        panel.setFrame(NSRect(origin: panel.frame.origin, size: compactSize), display: true)
+        try await snapshot(panel, named: "compact")
+
+        settings.isCompact = false
+        panel.contentView?.layoutSubtreeIfNeeded()
+        try await waitForMinimum(panel, compact: false)
+        let fullSize = PanelSizing.minimumFrameSize(for: panel, compact: false)
+        panel.setFrame(NSRect(origin: panel.frame.origin, size: fullSize), display: true)
+        try await snapshot(panel, named: "full")
+        let userSize = panel.frame.size
+        settings.isCompact = true
+        panel.contentView?.layoutSubtreeIfNeeded()
+        try await waitForMinimum(panel, compact: true)
+        #expect(panel.frame.size == userSize) // Minimum bounds must not force an ideal size.
+    }
+
+    @Test func undersizedSavedFramesAreCorrectedAndBothModesStillRememberSizes() throws {
+        try withDefaults { defaults in
+            let frames = PanelFrameStore(defaults: defaults)
+            let screen = NSRect(x: 0, y: 0, width: 1440, height: 1000)
+            for compact in [true, false] {
+                let tooSmall = NSRect(x: 100, y: 700, width: 100, height: 100)
+                frames.save(tooSmall, compact: compact)
+                let stored = try #require(frames.frame(compact: compact))
+                let restored = PanelSizing.restoredFrame(stored,
+                    minimum: PanelSizing.minimumContentSize(compact: compact), visibleFrame: screen)
+                #expect(restored.size == PanelSizing.minimumContentSize(compact: compact))
+                #expect(restored.maxY == tooSmall.maxY)
+                frames.save(restored, compact: compact)
+            }
+            let nextRun = PanelFrameStore(defaults: defaults)
+            #expect(nextRun.frame(compact: true)?.size == NSSize(width: 480, height: 380))
+            #expect(nextRun.frame(compact: false)?.size == NSSize(width: 960, height: 660))
+            let tinyScreen = NSRect(x: 0, y: 0, width: 800, height: 600)
+            let minimum = PanelSizing.minimumContentSize(compact: false)
+            let constrained = PanelSizing.restoredFrame(NSRect(origin: .zero, size: minimum), minimum: minimum, visibleFrame: tinyScreen)
+            #expect(constrained.size == minimum)
+            #expect(constrained.minX == tinyScreen.minX && constrained.maxY == tinyScreen.maxY)
+        }
+    }
+
+    @Test func resizeDelegateEnforcesMinimumEvenIfNativeLimitsWereCleared() {
+        let panel = ClipboardPanel(contentRect: NSRect(x: 0, y: 0, width: 1040, height: 680),
+                                   styleMask: [.titled, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
+        panel.contentMinSize = .zero
+        let delegate = AppDelegate()
+        let requested = NSSize(width: 100, height: 100)
+        #expect(delegate.windowWillResize(panel, to: requested) == PanelSizing.minimumFrameSize(for: panel, compact: false))
+    }
+
+    private func waitForMinimum(_ panel: NSPanel, compact: Bool) async throws {
+        let size = PanelSizing.minimumContentSize(compact: compact)
+        for _ in 0..<100 {
+            if panel.contentMinSize.width == size.width && panel.contentMinSize.height >= size.height { return }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try #require(panel.contentMinSize.width == size.width && panel.contentMinSize.height >= size.height)
+    }
+
+    private func snapshot(_ panel: NSPanel, named name: String) async throws {
+        guard let path = ProcessInfo.processInfo.environment["QPASTE_MINIMUM_SNAPSHOTS"], let view = panel.contentView else { return }
+        try await Task.sleep(for: .milliseconds(60))
+        view.layoutSubtreeIfNeeded(); view.needsDisplay = true; view.displayIfNeeded()
+        let bitmap = try #require(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+        view.cacheDisplay(in: view.bounds, to: bitmap)
+        let png = try #require(bitmap.representation(using: .png, properties: [:]))
+        let directory = URL(fileURLWithPath: path)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try png.write(to: directory.appendingPathComponent(name + ".png"))
+    }
+
     private func withDefaults(_ body: (UserDefaults) throws -> Void) throws {
         let name = "qpaste-window-tests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: name)!

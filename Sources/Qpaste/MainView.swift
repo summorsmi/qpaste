@@ -28,6 +28,8 @@ struct MainView: View {
     var body: some View {
         HStack(spacing: 0) {
             sidebar
+                .fixedSize(horizontal: true, vertical: false)
+                .layoutPriority(1)
             Rectangle().fill(Palette.line).frame(width: 1)
             VStack(spacing: 0) {
                 searchBar
@@ -48,7 +50,9 @@ struct MainView: View {
         }
         .background(Palette.surface)
         .tint(Palette.accent)
-        .frame(minWidth: settings.isCompact ? 420 : 900, minHeight: settings.isCompact ? 360 : 540)
+        .frame(minWidth: PanelSizing.minimumContentSize(compact: settings.isCompact).width,
+               minHeight: PanelSizing.minimumContentSize(compact: settings.isCompact).height,
+               alignment: .topLeading)
         .ignoresSafeArea(.container, edges: .top)
         .environment(\.locale, Locale(identifier: "zh_CN"))
         .overlay(alignment: .bottom) {

@@ -107,14 +107,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.isReleasedWhenClosed = false
         panel.isMovableByWindowBackground = true
         panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
-        configurePanelChrome(compact: settings.isCompact)
         panel.delegate = self
-        let hostingView = NSHostingView(rootView: MainView(store: store, settings: settings,
+        let hostingView = PanelSizing.hostingView(rootView: MainView(store: store, settings: settings,
             paste: { [weak self] entry, plain in self?.paste(entry, plainText: plain) },
             copy: { [weak self] entry, plain in self?.copy(entry, plainText: plain) }))
-        // Window geometry belongs to the user, not the changing SwiftUI layout.
-        hostingView.sizingOptions = []
         panel.contentView = hostingView
+        configurePanelChrome(compact: settings.isCompact)
         if let frame = panelFrames.frame(compact: displayedCompactMode) {
             restorePanelFrame(frame)
         } else { panel.center() }
@@ -127,7 +125,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func configurePanelChrome(compact: Bool) {
-        panel.minSize = compact ? NSSize(width: 420, height: 360) : NSSize(width: 900, height: 570)
+        panel.contentMinSize = PanelSizing.minimumContentSize(compact: compact)
         for button in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
             panel.standardWindowButton(button)?.isHidden = compact
         }
@@ -160,17 +158,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func restorePanelFrame(_ desired: NSRect) {
         isRestoringFrame = true
         defer { isRestoringFrame = false }
-        var frame = desired
-        frame.size.width = max(frame.width, panel.minSize.width)
-        frame.size.height = max(frame.height, panel.minSize.height)
         let matchingScreen = NSScreen.screens.first { $0.visibleFrame.intersects(desired) }
-        if let screen = matchingScreen ?? panel.screen ?? NSScreen.main {
-            let visible = screen.visibleFrame
-            frame.size.width = min(frame.width, visible.width)
-            frame.size.height = min(frame.height, visible.height)
-            frame.origin.x = max(visible.minX, min(frame.minX, visible.maxX - frame.width))
-            frame.origin.y = max(visible.minY, min(frame.minY, visible.maxY - frame.height))
-        }
+        let frame = PanelSizing.restoredFrame(desired,
+            minimum: PanelSizing.minimumFrameSize(for: panel, compact: displayedCompactMode),
+            visibleFrame: (matchingScreen ?? panel.screen ?? NSScreen.main)?.visibleFrame)
         panel.setFrame(frame, display: true)
     }
 
@@ -196,7 +187,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
     }
 
-    func windowDidResize(_ notification: Notification) { scheduleFrameSave() }
+    func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
+        PanelSizing.constrainedSize(frameSize,
+            minimum: PanelSizing.minimumFrameSize(for: sender, compact: displayedCompactMode))
+    }
+
+    func windowDidResize(_ notification: Notification) {
+        if canRememberFrame {
+            let minimum = PanelSizing.minimumFrameSize(for: panel, compact: displayedCompactMode)
+            if panel.frame.width < minimum.width || panel.frame.height < minimum.height {
+                restorePanelFrame(panel.frame)
+            }
+        }
+        scheduleFrameSave()
+    }
     func windowDidMove(_ notification: Notification) { scheduleFrameSave() }
     func windowDidEndLiveResize(_ notification: Notification) {
         frameSaveWork?.cancel()
