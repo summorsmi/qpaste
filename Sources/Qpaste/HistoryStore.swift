@@ -77,7 +77,7 @@ final class HistoryStore: ObservableObject {
     var filteredEntries: [HistoryListItem] { entries }
     var dateSections: [HistoryDateSection<HistoryListItem>] { HistoryDates.sections(entries, now: referenceDate) }
     var selected: ClipboardEntry? { selectedItem?.id == selectedContent?.id ? selectedContent : nil }
-    var selectedItem: HistoryListItem? { isLoading ? nil : (entries.first { $0.id == selectedID } ?? entries.first) }
+    var selectedItem: HistoryListItem? { entries.first { $0.id == selectedID } ?? entries.first }
     var historyCount: Int { count(for: .all) - count(for: .snippets) }
     var snippetCount: Int { count(for: .snippets) }
     var hasMore: Bool { databaseEntries.count < databaseCount }
@@ -161,11 +161,20 @@ final class HistoryStore: ObservableObject {
         guard drainPending() else { return }
         let index = entries.firstIndex { $0.id == id } ?? 0
         let remaining = entries.filter { $0.id != id }
-        let preferred = remaining.isEmpty ? nil : remaining[min(index, remaining.count - 1)].id
+        let preferred = selectedID != id ? selectedID
+            : remaining.isEmpty ? nil : remaining[min(index, remaining.count - 1)].id
         do {
             try ioQueue.sync { try repository.saveChanges(deleting: [id]); try repository.removeUnreferencedImages() }
-            invalidateContent()
-            reload(preferredID: preferred)
+            // Publish the surviving selection before the asynchronous refresh.
+            // Other entries' bodies are still valid and can stay in the cache.
+            contentCache.remove(id)
+            entries = remaining
+            databaseEntries.removeAll { $0.id == id }
+            databaseCount = max(0, databaseCount - 1)
+            resultCount = max(0, resultCount - 1)
+            selectedID = preferred
+            reconcileSelection()
+            reload()
             notify(isSnippet ? "片段已删除" : "记录已删除")
         } catch { reportWriteError(error) }
     }
@@ -379,7 +388,7 @@ final class HistoryStore: ObservableObject {
 
     private func refreshSelectedContent() {
         let item = selectedItem
-        if selectedContentKey == item, selectedContent != nil { return }
+        if selectedContentKey == item, selectedContent != nil || isLoadingContent { return }
         selectedContentTask?.cancel()
         selectedContent = nil; selectedContentKey = item
         contentError = nil; isLoadingContent = false

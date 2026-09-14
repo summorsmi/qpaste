@@ -3,6 +3,7 @@ import SwiftUI
 import Combine
 import ApplicationServices
 import QpasteCore
+import QuartzCore
 
 final class ClipboardPanel: NSPanel {
     override var canBecomeKey: Bool { true }
@@ -31,6 +32,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var isRestoringFrame = false
     private var frameBeforeSheet: NSRect?
     private var frameSaveWork: DispatchWorkItem?
+    private var modeTransitionGeneration = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // A --demo instance uses isolated sample data and never reads the system clipboard.
@@ -136,6 +138,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         frameSaveWork?.cancel()
         rememberPanelFrame()
         pendingCompactMode = compact
+        // Avoid SwiftUI's new minimum snapping the window to full size before
+        // AppKit can animate it. Restore automatic bounds after the transition.
+        if panel.attachedSheet == nil {
+            isRestoringFrame = true
+            (panel.contentView as? NSHostingView<MainView>)?.sizingOptions = []
+            panel.contentMinSize = PanelSizing.minimumContentSize(compact: true)
+        }
         DispatchQueue.main.async { [weak self] in self?.applyPendingDisplayMode() }
     }
 
@@ -144,25 +153,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let oldFrame = frameBeforeSheet ?? panelFrames.frame(compact: displayedCompactMode) ?? panel.frame
         displayedCompactMode = compact
         isRestoringFrame = true
-        configurePanelChrome(compact: compact)
+        modeTransitionGeneration += 1
+        let generation = modeTransitionGeneration
+        (panel.contentView as? NSHostingView<MainView>)?.sizingOptions = []
+        panel.contentMinSize = PanelSizing.minimumContentSize(compact: true)
         let size = defaultPanelSize(compact: compact)
         let desired = panelFrames.frame(compact: compact)
             ?? NSRect(x: oldFrame.minX, y: oldFrame.maxY - size.height, width: size.width, height: size.height)
-        restorePanelFrame(desired)
+        let frame = constrainedPanelFrame(desired)
         pendingCompactMode = nil
-        isRestoringFrame = false
-        panelFrames.save(panel.frame, compact: compact)
-        store.focusSearchToken += 1
+        let finish = { [weak self] in
+            guard let self, self.modeTransitionGeneration == generation,
+                  self.pendingCompactMode == nil else { return }
+            (self.panel.contentView as? NSHostingView<MainView>)?.sizingOptions = [.minSize]
+            self.configurePanelChrome(compact: compact)
+            self.isRestoringFrame = false
+            self.panelFrames.save(self.panel.frame, compact: compact)
+            self.store.focusSearchToken += 1
+        }
+        if panel.isVisible && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = PanelSizing.modeTransitionDuration
+                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                panel.animator().setFrame(frame, display: true)
+            } completionHandler: { finish() }
+        } else {
+            panel.setFrame(frame, display: true)
+            finish()
+        }
+    }
+
+    private func constrainedPanelFrame(_ desired: NSRect) -> NSRect {
+        let matchingScreen = NSScreen.screens.first { $0.visibleFrame.intersects(desired) }
+        return PanelSizing.restoredFrame(desired,
+            minimum: PanelSizing.minimumFrameSize(for: panel, compact: displayedCompactMode),
+            visibleFrame: (matchingScreen ?? panel.screen ?? NSScreen.main)?.visibleFrame)
     }
 
     private func restorePanelFrame(_ desired: NSRect) {
+        let wasRestoringFrame = isRestoringFrame
         isRestoringFrame = true
-        defer { isRestoringFrame = false }
-        let matchingScreen = NSScreen.screens.first { $0.visibleFrame.intersects(desired) }
-        let frame = PanelSizing.restoredFrame(desired,
-            minimum: PanelSizing.minimumFrameSize(for: panel, compact: displayedCompactMode),
-            visibleFrame: (matchingScreen ?? panel.screen ?? NSScreen.main)?.visibleFrame)
-        panel.setFrame(frame, display: true)
+        defer { isRestoringFrame = wasRestoringFrame }
+        panel.setFrame(constrainedPanelFrame(desired), display: true)
     }
 
     private var canRememberFrame: Bool {
@@ -188,7 +220,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
-        PanelSizing.constrainedSize(frameSize,
+        if isRestoringFrame { return frameSize }
+        return PanelSizing.constrainedSize(frameSize,
             minimum: PanelSizing.minimumFrameSize(for: sender, compact: displayedCompactMode))
     }
 

@@ -2,6 +2,8 @@ import AppKit
 import SwiftUI
 
 enum PanelSizing {
+    static let modeTransitionDuration = 0.22
+
     static func minimumContentSize(compact: Bool) -> NSSize {
         compact ? NSSize(width: 480, height: 380) : NSSize(width: 960, height: 660)
     }

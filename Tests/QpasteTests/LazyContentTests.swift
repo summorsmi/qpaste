@@ -91,6 +91,52 @@ struct LazyContentTests {
         }
     }
 
+    @Test func rapidDeletionSelectsSurvivorsBeforeBackgroundQueriesFinish() async throws {
+        try await fixture(count: 8, synchronous: false) { store in
+            let original = store.entries
+            for index in 0..<7 {
+                let selected = try #require(store.selectedItem)
+                #expect(selected.id == original[index].id)
+                store.delete(selected)
+                #expect(store.isLoading)
+                #expect(store.selectedItem?.id == original[index + 1].id)
+                #expect(store.selectedID == original[index + 1].id)
+                #expect(!store.entries.contains { $0.id == selected.id })
+            }
+            for _ in 0..<200 where store.isLoading || store.isLoadingContent {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            #expect(!store.isLoading && !store.isLoadingContent)
+            #expect(store.selected?.id == original[7].id)
+            #expect(store.entries.count == 1 && store.resultCount == 1)
+            #expect(store.contentError == nil)
+            store.delete(try #require(store.selectedItem))
+            #expect(store.selectedItem == nil && store.entries.isEmpty)
+            for _ in 0..<200 where store.isLoading { try await Task.sleep(for: .milliseconds(10)) }
+            #expect(!store.isLoading && store.resultCount == 0)
+        }
+    }
+
+    @Test func deletionKeepsCachedNeighborAndUnrelatedSelection() async throws {
+        try await fixture(count: 8, synchronous: false) { store in
+            let original = store.entries
+            _ = try await store.content(for: original[1])
+            store.delete(original[0])
+            #expect(store.selected?.id == original[1].id)
+            #expect(!store.isLoadingContent)
+            store.delete(original[5])
+            #expect(store.selected?.id == original[1].id)
+            store.selectedID = original[7].id
+            store.delete(original[7])
+            #expect(store.selectedItem?.id == original[6].id)
+            for _ in 0..<200 where store.isLoading || store.isLoadingContent {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            #expect(store.selected?.id == original[6].id)
+            #expect(store.resultCount == 5 && store.contentError == nil)
+        }
+    }
+
     @Test func unreadableBodyShowsErrorInsteadOfSubstitutingASummary() async throws {
         try await fixture(synchronous: false) { store in
             let item = store.entries[35]

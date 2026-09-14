@@ -20,6 +20,7 @@ struct MainView: View {
     let paste: (HistoryListItem, Bool) -> Void
     let copy: (HistoryListItem, Bool) -> Void
     @FocusState private var searchFocused: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ViewState<ClipboardEntry?> private var previewImage = nil
     @ViewState<Bool> private var accessibilityEnabled = AXIsProcessTrusted()
     @StateObject private var hoverPreview = HoverPreviewController()
@@ -35,17 +36,17 @@ struct MainView: View {
                 searchBar
                 if store.dateFilter.isActive { activeDateRange }
                 Rectangle().fill(Palette.line).frame(height: 1)
-                if settings.isCompact {
-                    historyList.frame(maxWidth: .infinity, maxHeight: .infinity)
-                    compactNotices
-                } else {
-                    HStack(spacing: 0) {
-                        historyList.frame(width: 320)
+                HStack(spacing: 0) {
+                    historyList
+                        .frame(width: settings.isCompact ? nil : 320)
+                        .frame(maxWidth: settings.isCompact ? .infinity : nil, maxHeight: .infinity)
+                    if !settings.isCompact {
                         Rectangle().fill(Palette.line).frame(width: 1)
                         detail.frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .transition(.opacity)
                     }
-                    footer
                 }
+                if settings.isCompact { compactNotices } else { footer }
             }
         }
         .background(Palette.surface)
@@ -53,6 +54,8 @@ struct MainView: View {
         .frame(minWidth: PanelSizing.minimumContentSize(compact: settings.isCompact).width,
                minHeight: PanelSizing.minimumContentSize(compact: settings.isCompact).height,
                alignment: .topLeading)
+        .clipped()
+        .animation(reduceMotion ? nil : .easeInOut(duration: PanelSizing.modeTransitionDuration), value: settings.isCompact)
         .ignoresSafeArea(.container, edges: .top)
         .environment(\.locale, Locale(identifier: "zh_CN"))
         .overlay(alignment: .bottom) {
@@ -379,36 +382,36 @@ struct MainView: View {
     }
 
     @ViewBuilder private var detail: some View {
-        if let entry = store.selected, let item = store.selectedItem {
+        if let item = store.selectedItem {
             VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 8) {
-                    Image(systemName: entry.isSnippet ? "text.badge.plus" : entry.kind.symbol)
-                    Text(entry.isSnippet ? "文本片段" : entry.looksLikeCode ? "代码文本" : entry.kind.title)
+                    Image(systemName: item.isSnippet ? "text.badge.plus" : item.kind.symbol)
+                    Text(item.isSnippet ? "文本片段" : item.looksLikeCode ? "代码文本" : item.kind.title)
                     Spacer()
-                    if entry.kind == .text || entry.kind == .link {
-                        iconButton(entry.isSnippet ? "square.and.pencil" : "text.badge.plus", help: entry.isSnippet ? "编辑文本片段" : "存为文本片段") { store.editSnippet(from: entry) }
+                    if item.kind == .text || item.kind == .link {
+                        iconButton(item.isSnippet ? "square.and.pencil" : "text.badge.plus", help: item.isSnippet ? "编辑文本片段" : "存为文本片段") { store.editSnippet(from: item) }
                     }
-                    if !entry.isSnippet {
-                        iconButton(entry.isFavorite ? "star.fill" : "star", help: entry.isFavorite ? "取消收藏" : "加入收藏") { store.toggleFavorite(entry) }
+                    if !item.isSnippet {
+                        iconButton(item.isFavorite ? "star.fill" : "star", help: item.isFavorite ? "取消收藏" : "加入收藏") { store.toggleFavorite(item) }
                     }
-                    iconButton("trash", help: "删除记录") { store.delete(entry) }
+                    iconButton("trash", help: "删除记录") { store.delete(item) }
                 }.font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
                     .padding(.horizontal, 27).padding(.top, 19).padding(.bottom, 25)
 
-                if entry.isSnippet {
-                    Text(entry.title).font(.system(size: 20, weight: .semibold)).padding(.horizontal, 28).padding(.bottom, 18)
+                if item.isSnippet {
+                    Text(item.title).font(.system(size: 20, weight: .semibold)).padding(.horizontal, 28).padding(.bottom, 18)
                 }
-                contentPreview(entry).id(entry.id).padding(.horizontal, 27)
+                selectedContentPreview.id(item.id).padding(.horizontal, 27)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
 
                 VStack(alignment: .leading, spacing: 16) {
-                    Text((entry.isSnippet ? "修改于 " : "复制于 ") + entry.displayDate.formatted(date: .numeric, time: .standard))
+                    Text((item.isSnippet ? "修改于 " : "复制于 ") + item.displayDate.formatted(date: .numeric, time: .standard))
                         .font(.system(size: 10)).foregroundStyle(.tertiary)
                     HStack(spacing: 6) {
-                        Image(systemName: entry.isSnippet ? "text.badge.plus" : "app.dashed")
-                        Text(entry.sourceName)
+                        Image(systemName: item.isSnippet ? "text.badge.plus" : "app.dashed")
+                        Text(item.sourceName)
                         Spacer()
-                        Text(entry.kind == .image ? ByteCountFormatter.string(fromByteCount: Int64(entry.byteCount), countStyle: .file) : entry.kind == .files ? "\(entry.filePaths.count) 个文件" : "\(entry.text.count) 字符")
+                        Text(detailSizeLabel(item))
                     }.font(.system(size: 10)).foregroundStyle(.tertiary)
                     Rectangle().fill(Palette.line).frame(height: 1)
                     HStack(spacing: 9) {
@@ -417,9 +420,9 @@ struct MainView: View {
                                 .font(.system(size: 12, weight: .medium)).padding(.horizontal, 13).padding(.vertical, 9)
                         }.buttonStyle(.plain).foregroundStyle(.white).background(Palette.accent, in: RoundedRectangle(cornerRadius: 7))
                             .accessibilityLabel("粘贴选中内容")
-                        if entry.kind != .image {
+                        if item.kind != .image {
                             Button { paste(item, true) } label: {
-                                Text(entry.kind == .files ? "粘贴路径" : "纯文本粘贴").font(.system(size: 11)).padding(.horizontal, 10).padding(.vertical, 9)
+                                Text(item.kind == .files ? "粘贴路径" : "纯文本粘贴").font(.system(size: 11)).padding(.horizontal, 10).padding(.vertical, 9)
                             }.buttonStyle(.plain).background(Palette.subtle, in: RoundedRectangle(cornerRadius: 7))
                                 .help("⇧↩ · 去掉格式后粘贴")
                         }
@@ -428,13 +431,29 @@ struct MainView: View {
                     }
                 }.padding(27).padding(.top, 4)
             }
-        } else if store.isLoadingContent {
-            ProgressView().controlSize(.small).frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if let error = store.contentError {
-            ContentUnavailableView("详情无法读取", systemImage: "exclamationmark.circle", description: Text(error))
+        } else if store.isLoading {
+            Color.clear.frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             welcome
         }
+    }
+
+    @ViewBuilder private var selectedContentPreview: some View {
+        if let entry = store.selected {
+            contentPreview(entry)
+        } else if let error = store.contentError {
+            ContentUnavailableView("详情无法读取", systemImage: "exclamationmark.circle", description: Text(error))
+        } else {
+            // Keep the detail layout and actions stable while the body loads.
+            Color.clear
+        }
+    }
+
+    private func detailSizeLabel(_ item: HistoryListItem) -> String {
+        if let entry = store.selected, item.kind != .image {
+            return item.kind == .files ? "\(entry.filePaths.count) 个文件" : "\(entry.text.count) 字符"
+        }
+        return ByteCountFormatter.string(fromByteCount: Int64(item.byteCount), countStyle: .file)
     }
 
     @ViewBuilder private func contentPreview(_ entry: ClipboardEntry) -> some View {
