@@ -304,7 +304,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc private func toggleRecording() { settings.isPaused.toggle() }
 
     private func togglePanel() {
-        if panel.isVisible && panel.isKeyWindow { panel.orderOut(nil) } else { showPanel() }
+        if panel.isVisible && panel.isKeyWindow { hidePanel() } else { showPanel() }
+    }
+
+    private func hidePanel() {
+        store.cancelImageLoads()
+        panel.orderOut(nil)
     }
 
     private func showPanel() {
@@ -319,6 +324,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         rememberPanelFrame()
+        store.cancelImageLoads()
         sender.orderOut(nil)
         return false
     }
@@ -331,7 +337,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard let self, let panel = self.panel,
                   panel.isVisible, !panel.isKeyWindow, panel.attachedSheet == nil,
                   !self.store.showSettings, self.store.snippetDraft == nil else { return }
-            panel.orderOut(nil)
+            self.hidePanel()
         }
     }
 
@@ -382,7 +388,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
         pasteTask?.cancel()
-        panel.orderOut(nil)
+        hidePanel()
         target.activate()
         pasteTask = Task { [weak self] in
             // Wait for focus and for the user's shortcut modifiers to be released.
@@ -418,7 +424,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if response == .alertFirstButtonReturn {
                 NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
             } else {
-                self?.panel.orderOut(nil)
+                self?.hidePanel()
                 self?.previousApp?.activate()
             }
         }
@@ -443,10 +449,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let shift = flags.contains(.shift)
         let editing = panel.firstResponder as? NSTextView
         if editing?.hasMarkedText() == true { return event }
-        if event.keyCode == 53 { panel.orderOut(nil); return nil }
+        if event.keyCode == 53 { hidePanel(); return nil }
         if command, event.charactersIgnoringModifiers == "f" { store.focusSearchToken += 1; return nil }
         if command, event.charactersIgnoringModifiers == "n" { store.editSnippet(); return nil }
-        if command, event.charactersIgnoringModifiers == "w" { panel.orderOut(nil); return nil }
+        if command, event.charactersIgnoringModifiers == "w" { hidePanel(); return nil }
         if event.keyCode == 125 && !command { store.moveSelection(by: 1); return nil }
         if event.keyCode == 126 && !command { store.moveSelection(by: -1); return nil }
         if event.keyCode == 36 || event.keyCode == 76 {

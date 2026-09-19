@@ -7,7 +7,8 @@ import QpasteCore
 struct SnippetEditor: View {
     @Environment(\.dismiss) private var dismiss
     @ViewState<SnippetDraft> var draft: SnippetDraft
-    var save: (SnippetDraft) -> Void
+    var save: (SnippetDraft) -> Bool
+    @ViewState<Bool> private var saveRejected = false
     @FocusState private var nameFocused: Bool
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -33,11 +34,17 @@ struct SnippetEditor: View {
                     .overlay(RoundedRectangle(cornerRadius: 8).stroke(Palette.line))
                     .accessibilityLabel("片段内容")
             }
+            if saveRejected {
+                Text("暂存空间不足，片段尚未保存。请稍后重试，或减少内容。")
+                    .font(.caption).foregroundStyle(.orange)
+            }
             HStack {
                 Text("文本片段会一直保留").font(.system(size: 10)).foregroundStyle(.tertiary)
                 Spacer()
                 Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
-                Button("保存片段") { save(draft); dismiss() }.buttonStyle(.borderedProminent)
+                Button("保存片段") {
+                    if save(draft) { dismiss() } else { saveRejected = true }
+                }.buttonStyle(.borderedProminent)
                     .keyboardShortcut("s", modifiers: .command)
                     .disabled(draft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || draft.body.isEmpty)
             }
@@ -125,7 +132,7 @@ struct SettingsView: View {
                     }
                     Text("内容仅存于这台 Mac；按你的偏好，带敏感标记的内容也会记录。")
                         .font(.system(size: 10)).foregroundStyle(.secondary)
-                    if let error = store.storageError { Text(error).font(.caption).foregroundStyle(.orange) }
+                    if let error = store.capturePauseReason ?? store.storageError { Text(error).font(.caption).foregroundStyle(.orange) }
                     HStack {
                         Toggle("同时清空收藏", isOn: $includeFavorites).toggleStyle(.checkbox)
                         Spacer()

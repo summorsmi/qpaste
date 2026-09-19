@@ -6,6 +6,13 @@ struct CapturedClipboard {
     var entry: ClipboardEntry
     var imageData: Data?
     var thumbnail: NSImage?
+
+    var retainedBytes: Int {
+        entry.text.utf8.count + (entry.richText?.count ?? 0) + (imageData?.count ?? 0)
+            + entry.filePaths.reduce(0) { $0 + $1.utf8.count + 64 }
+            + (entry.snippetName?.utf8.count ?? 0) + entry.sourceName.utf8.count
+            + (entry.sourceBundleID?.utf8.count ?? 0) + entry.fingerprint.utf8.count + 1_024
+    }
 }
 
 struct ClipboardSnapshot {
@@ -14,6 +21,21 @@ struct ClipboardSnapshot {
     let sourceName: String
     let sourceBundleID: String?
     let date: Date
+
+    // Reserve both the snapshot and the largest accepted encoded result before
+    // enqueueing. Decoded image pixels are temporary worker memory, not this budget.
+    var reservedBytes: Int {
+        let overhead = 4_096 + 2 * (sourceName.utf8.count + (sourceBundleID?.utf8.count ?? 0))
+        switch payload {
+        case .image(let data):
+            return overhead + data.count + ClipboardMonitor.maximumImageBytes
+                + ImageThumbnail.maximumPixelSize * ImageThumbnail.maximumPixelSize * 4
+        case .text(let text, let rich):
+            return overhead + (text?.utf8.count ?? ClipboardMonitor.maximumTextBytes) + (rich?.count ?? 0)
+        case .files(let paths):
+            return overhead + paths.reduce(0) { $0 + $1.utf8.count * 8 + 128 }
+        }
+    }
 }
 
 struct ClipboardImageData {
@@ -51,6 +73,7 @@ final class ClipboardMonitor {
     }
 
     func start() {
+        guard timer == nil else { return }
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.poll() }
         }
@@ -72,6 +95,13 @@ final class ClipboardMonitor {
     func poll() {
         ticks += 1
         if ticks % 120 == 0 { store.applyRetention() }
+        if ticks % 10 == 0 { store.retryBufferedCaptures() }
+        if store.capturePauseReason != nil {
+            store.resumeCaptureIfPossible()
+            // Copies made while automatically paused must not be replayed later.
+            resetBaseline()
+            return
+        }
         if store.settings.isPaused || wasPaused != store.settings.isPaused {
             resetBaseline()
             return
@@ -84,13 +114,12 @@ final class ClipboardMonitor {
             guard let snapshot = try Self.readSnapshot(from: pasteboard, sourceName: source?.localizedName ?? "未知应用",
                                                        sourceBundleID: source?.bundleIdentifier),
                   pasteboard.changeCount == observedCount else { return }
+            guard let write = store.makeCaptureWriter(reserving: snapshot.reservedBytes) else { return }
             if synchronousCapture {
-                if let captured = try decode(snapshot) {
-                    store.add(captured.entry, imageData: captured.imageData, thumbnail: captured.thumbnail)
-                }
+                do { write(try decode(snapshot))() }
+                catch { write(nil)(); throw error }
                 return
             }
-            let write = store.makeCaptureWriter()
             let decode = decode, completions = completions
             captureQueue.async { [weak self] in
                 autoreleasepool {
@@ -132,7 +161,11 @@ final class ClipboardMonitor {
             guard data.count <= maximumImageBytes else { throw CaptureError.imageTooLarge }
             payload = .image(data)
         } else {
-            payload = .text(pasteboard.string(forType: .string) ?? pasteboard.string(forType: .URL), pasteboard.data(forType: .rtf))
+            let text = pasteboard.string(forType: .string) ?? pasteboard.string(forType: .URL)
+            guard (text?.utf8.count ?? 0) <= maximumTextBytes else { throw CaptureError.textTooLarge }
+            let rich = pasteboard.data(forType: .rtf)
+            if text == nil, (rich?.count ?? 0) > maximumTextBytes { throw CaptureError.richTextTooLarge }
+            payload = .text(text, rich.flatMap { $0.count <= maximumTextBytes ? $0 : nil })
         }
         return ClipboardSnapshot(payload: payload, sourceName: name, sourceBundleID: bundleID, date: date)
     }

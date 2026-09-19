@@ -82,14 +82,16 @@ struct MainView: View {
         }
         .onChange(of: store.focusSearchToken) { _, _ in searchFocused = true }
         .onAppear { searchFocused = true; accessibilityEnabled = AXIsProcessTrusted() }
-        .onChange(of: settings.isCompact) { _, _ in accessibilityEnabled = AXIsProcessTrusted(); hoverPreview.dismiss() }
+        .onChange(of: settings.isCompact) { _, _ in
+            accessibilityEnabled = AXIsProcessTrusted(); hoverPreview.dismiss(); store.cancelPreviewImages()
+        }
         .onChange(of: store.query) { _, _ in hoverPreview.dismiss() }
         .onChange(of: store.filter) { _, _ in hoverPreview.dismiss() }
         .onChange(of: store.dateFilter) { _, _ in hoverPreview.dismiss() }
         .onChange(of: store.isLoading) { _, loading in if loading { hoverPreview.dismiss() } }
         .onChange(of: store.showSettings) { _, _ in hoverPreview.dismiss() }
         .onChange(of: store.snippetDraft?.id) { _, _ in hoverPreview.dismiss() }
-        .onDisappear { hoverPreview.dismiss() }
+        .onDisappear { hoverPreview.dismiss(); store.cancelImageLoads() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             accessibilityEnabled = AXIsProcessTrusted()
         }
@@ -146,8 +148,9 @@ struct MainView: View {
             Spacer(minLength: 16)
             VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 7) {
-                    Circle().fill(settings.isPaused ? Color.orange : Color.green).frame(width: 5, height: 5)
-                    Text(settings.isPaused ? "记录已暂停" : "正在记录剪贴板").font(.system(size: 11)).foregroundStyle(.secondary)
+                    Circle().fill(settings.isPaused || store.capturePauseReason != nil ? Color.orange : Color.green).frame(width: 5, height: 5)
+                    Text(settings.isPaused ? "记录已暂停" : store.capturePauseReason != nil ? "记录已自动暂停" : "正在记录剪贴板")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
                     Spacer()
                     Button { settings.isPaused.toggle() } label: {
                         Image(systemName: settings.isPaused ? "play.fill" : "pause.fill").font(.system(size: 10))
@@ -367,6 +370,7 @@ struct MainView: View {
                 .accessibilityHidden(true)
         }
         .accessibilityElement(children: .combine)
+        .onDisappear { store.cancelThumbnail(for: entry) }
         .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
         .accessibilityAction { store.selectedID = entry.id }
         .contextMenu {
@@ -530,6 +534,7 @@ struct MainView: View {
     }
 
     @ViewBuilder private var compactNotices: some View {
+        if let issue = store.capturePauseReason { compactNotice(issue) }
         if let issue = store.storageError { compactNotice(issue) }
         if let issue = store.contentError { compactNotice("详情无法读取：\(issue)") }
         if let issue = store.shortcutError {
@@ -554,7 +559,7 @@ struct MainView: View {
     private var footer: some View {
         VStack(spacing: 0) {
             Rectangle().fill(Palette.line).frame(height: 1)
-            if let issue = store.storageError ?? store.shortcutError {
+            if let issue = store.capturePauseReason ?? store.storageError ?? store.shortcutError {
                 HStack {
                     Image(systemName: "exclamationmark.circle")
                     Text(issue).lineLimit(2)

@@ -6,13 +6,16 @@ import Testing
 @Suite("后台采集和图片", .serialized)
 @MainActor
 struct BackgroundCaptureTests {
-    private func fixture(_ body: (HistoryStore, NSPasteboard) async throws -> Void) async throws {
+    private func fixture(maximumCaptureBytes: Int = 64 * 1_024 * 1_024, synchronous: Bool = false,
+                         imageQueue: DispatchQueue = DispatchQueue(label: "qpaste-test-images"),
+                         _ body: (HistoryStore, NSPasteboard) async throws -> Void) async throws {
         let name = "qpaste-background-\(UUID())"
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(name)
         let defaults = UserDefaults(suiteName: name)!
         let settings = AppSettings(defaults: defaults)
         settings.maximumCount = 0; settings.retentionDays = 0
-        let store = try HistoryStore(settings: settings, directory: directory)
+        let store = try HistoryStore(settings: settings, directory: directory, synchronousQueries: synchronous,
+                                     maximumCaptureBytes: maximumCaptureBytes, imageQueue: imageQueue)
         let board = NSPasteboard(name: .init(name))
         defer { store.flush(); board.releaseGlobally(); defaults.removePersistentDomain(forName: name); try? FileManager.default.removeItem(at: directory) }
         try await body(store, board)
@@ -133,6 +136,127 @@ struct BackgroundCaptureTests {
         #expect(cache.byteCount <= cache.maximumBytes)
         cache.insert(NSImage(size: NSSize(width: 200, height: 200)), for: "large")
         #expect(cache.value(for: "large") == nil && cache.byteCount <= cache.maximumBytes)
+        cache.remove("a")
+        #expect(cache.value(for: "a") == nil && cache.byteCount == 40 * 40 * 4)
+        cache.removeAll()
+        #expect(cache.value(for: "c") == nil && cache.byteCount == 0)
+    }
+
+    @Test func captureQueuePausesAtFourAndDoesNotReplaySkippedCopies() async throws {
+        try await fixture { store, board in
+            let gate = DispatchSemaphore(value: 0)
+            let monitor = ClipboardMonitor(store: store, pasteboard: board, decode: { snapshot in
+                gate.wait(); return try ClipboardMonitor.decodeSnapshot(snapshot)
+            })
+            defer { for _ in 0..<8 { gate.signal() }; monitor.stop() }
+            for index in 0..<7 {
+                board.clearContents(); board.setString("copy \(index)", forType: .string)
+                monitor.poll()
+            }
+            #expect(store.inFlightCaptureCount == 4)
+            #expect(store.capturePauseReason != nil && !store.settings.isPaused)
+            #expect(store.bufferedCaptureBytes <= store.maximumCaptureBytes)
+            for _ in 0..<4 { gate.signal() }
+            monitor.stop()
+            #expect(store.inFlightCaptureCount == 0 && store.bufferedCaptureBytes == 0)
+            store.settings.isPaused = true
+            monitor.poll() // Recover automatic pause, preserving manual pause and baseline.
+            #expect(store.capturePauseReason == nil && store.settings.isPaused)
+            store.settings.isPaused = false
+            monitor.resetBaseline()
+            monitor.poll()
+            #expect(try store.repository.page().totalCount == 4)
+            board.clearContents(); board.setString("after recovery", forType: .string)
+            gate.signal(); monitor.poll(); monitor.stop()
+            let page = try store.repository.page()
+            #expect(page.totalCount == 5)
+            #expect(!page.entries.contains { ["copy 4", "copy 5", "copy 6"].contains($0.text) })
+        }
+    }
+
+    @Test func byteBudgetCoversReservationsAndFailedWritesUntilRetry() async throws {
+        try await fixture(maximumCaptureBytes: 24 * 1_024) { store, board in
+            let db = try SQLiteDatabase(url: store.repository.databaseURL)
+            try db.execute("CREATE TRIGGER fail_budget BEFORE INSERT ON entries BEGIN SELECT RAISE(FAIL,'test'); END")
+            let monitor = ClipboardMonitor(store: store, pasteboard: board)
+            defer { monitor.stop() }
+            var accepted = 0
+            for index in 0..<12 {
+                board.clearContents(); board.setString("\(index)" + String(repeating: "x", count: 6_000), forType: .string)
+                monitor.poll()
+                #expect(store.bufferedCaptureBytes <= store.maximumCaptureBytes)
+                monitor.stop()
+                #expect(store.bufferedCaptureBytes <= store.maximumCaptureBytes)
+                if store.capturePauseReason != nil { break }
+                accepted += 1
+            }
+            #expect(accepted > 0 && accepted < 12)
+            #expect(store.capturePauseReason != nil && store.bufferedCaptureBytes > 0)
+            let retained = store.bufferedCaptureBytes
+            #expect(!store.saveSnippet(SnippetDraft(name: "keep draft", body: String(repeating: "x", count: 24 * 1_024))))
+            #expect(store.bufferedCaptureBytes == retained)
+            try db.execute("DROP TRIGGER fail_budget")
+            for _ in 0..<10 { monitor.poll() } // Exercise the five-second retry cadence without sleeping.
+            #expect(store.capturePauseReason == nil && store.bufferedCaptureBytes == 0)
+            #expect(try store.repository.page().totalCount == accepted)
+            #expect(store.storageError == nil)
+        }
+    }
+
+    @Test func decodingFailureReleasesReservation() async throws {
+        try await fixture { store, board in
+            let monitor = ClipboardMonitor(store: store, pasteboard: board, decode: { _ in throw CaptureError.imageTooLarge })
+            defer { monitor.stop() }
+            board.clearContents(); board.setString("decode failure", forType: .string)
+            monitor.poll(); monitor.stop()
+            #expect(store.bufferedCaptureBytes == 0 && store.inFlightCaptureCount == 0)
+            #expect(store.toastIsError)
+        }
+    }
+
+    @Test func cancelledHoverCanImmediatelyReloadSameImage() async throws {
+        let queue = DispatchQueue(label: "qpaste-test-blocked-images")
+        let gate = DispatchSemaphore(value: 0)
+        queue.async { gate.wait() }
+        defer { gate.signal() }
+        try await fixture(imageQueue: queue) { store, _ in
+            let bitmap = try #require(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 10, pixelsHigh: 10,
+                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0))
+            memset(try #require(bitmap.bitmapData), 180, bitmap.bytesPerRow * bitmap.pixelsHigh)
+            let data = try #require(bitmap.representation(using: .png, properties: [:]))
+            let entry = ClipboardEntry(kind: .image, imageFileName: try store.repository.saveImage(data), imageWidth: 10, imageHeight: 10)
+            let old = Task { try await store.loadPreviewImage(for: entry) }
+            for _ in 0..<100 where store.pendingImageRequestCount == 0 { try await Task.sleep(for: .milliseconds(10)) }
+            #expect(store.pendingImageRequestCount == 1)
+            old.cancel()
+            var replacementStarted = false
+            let replacement = Task {
+                replacementStarted = true
+                return try await store.loadPreviewImage(for: entry)
+            }
+            for _ in 0..<100 where !replacementStarted { try await Task.sleep(for: .milliseconds(10)) }
+            gate.signal()
+            await #expect(throws: CancellationError.self) { try await old.value }
+            let image = try await replacement.value
+            #expect(image != nil && store.pendingImageRequestCount == 0)
+            #expect(store.failedImageRequestCount == 0)
+        }
+    }
+
+    @Test func failedImagesAreBoundedAndDeletionClearsTheirRecords() async throws {
+        try await fixture(synchronous: true) { store, _ in
+            for index in 0..<300 {
+                _ = store.thumbnail(for: ClipboardEntry(kind: .image, imageFileName: "missing-\(index).png"))
+            }
+            #expect(store.failedImageRequestCount == 256)
+            let entry = ClipboardEntry(kind: .image, imageFileName: "missing-299.png", fingerprint: "missing-299")
+            store.add(entry)
+            store.delete(entry)
+            #expect(store.failedImageRequestCount == 255)
+            store.clearHistory()
+            #expect(store.failedImageRequestCount == 0)
+        }
     }
 
     private func settle(_ store: HistoryStore, count: Int) async throws {

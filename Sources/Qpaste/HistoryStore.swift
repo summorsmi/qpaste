@@ -23,6 +23,7 @@ final class HistoryStore: ObservableObject {
     @Published var toast: String?
     @Published private(set) var toastIsError = false
     @Published var storageError: String?
+    @Published private(set) var capturePauseReason: String?
     @Published var shortcutError: String?
     @Published var showSettings = false
     @Published var snippetDraft: SnippetDraft?
@@ -42,11 +43,13 @@ final class HistoryStore: ObservableObject {
     var cachedContentBytes: Int { contentCache.byteCount }
     private let ioQueue = DispatchQueue(label: "app.qpaste.persistence", qos: .utility)
     private let queryQueue = DispatchQueue(label: "app.qpaste.queries", qos: .userInitiated)
-    private let imageQueue = DispatchQueue(label: "app.qpaste.images", qos: .userInitiated)
+    private let imageQueue: DispatchQueue
     private let thumbnailQueue = DispatchQueue(label: "app.qpaste.thumbnails", qos: .utility)
     private struct ImageRequest: Hashable { let name: String; let pixels: Int; let kind: String }
-    private var imageTasks: [ImageRequest: Task<NSImage?, Never>] = [:]
-    private var imageFailures = Set<ImageRequest>()
+    private var imageTasks: [ImageRequest: (token: HistoryQueryToken, task: Task<NSImage?, Never>)] = [:]
+    private var imageFailures: [ImageRequest] = []
+    var failedImageRequestCount: Int { imageFailures.count }
+    var pendingImageRequestCount: Int { imageTasks.count }
     @Published private var imageRefresh = 0
     private let images = ImageMemoryCache(maximumBytes: 60 * 1_024 * 1_024)
     private let previews = ImageMemoryCache(maximumBytes: 32 * 1_024 * 1_024)
@@ -59,6 +62,13 @@ final class HistoryStore: ObservableObject {
     private var summaryGeneration = 0
     private var loadedSummaryGeneration = 0
     private var capturePermits: [UUID: CaptureWritePermit] = [:]
+    let maximumCaptureBytes: Int
+    static let maximumInFlightCaptures = 4
+    var inFlightCaptureCount: Int { capturePermits.count }
+    var bufferedCaptureBytes: Int {
+        capturePermits.values.reduce(0) { $0 + $1.reservedBytes }
+            + pendingSaves.reduce(0) { $0 + $1.retainedBytes }
+    }
     private var databaseEntries: [HistoryListItem] = []
     private var databaseCount = 0
     private var loadedQuery = HistoryQuery()
@@ -71,9 +81,11 @@ final class HistoryStore: ObservableObject {
         var imageData: Data?
         var event: CopyEvent?
         let item: HistoryListItem
+        let retainedBytes: Int
         init(entry: ClipboardEntry, imageData: Data? = nil, event: CopyEvent? = nil) {
             self.entry = entry; self.imageData = imageData; self.event = event
             item = HistoryListItem(entry)
+            retainedBytes = CapturedClipboard(entry: entry, imageData: imageData).retainedBytes
         }
     }
     private var pendingSaves = [PendingSave]()
@@ -89,8 +101,12 @@ final class HistoryStore: ObservableObject {
     var hasMore: Bool { databaseEntries.count < databaseCount }
     private var currentQuery: HistoryQuery { HistoryQuery(filter: filter, text: query, interval: dateFilter.interval(now: referenceDate)) }
 
-    init(settings: AppSettings, directory: URL, synchronousQueries: Bool = false) throws {
+    init(settings: AppSettings, directory: URL, synchronousQueries: Bool = false,
+         maximumCaptureBytes: Int = 64 * 1_024 * 1_024,
+         imageQueue: DispatchQueue = DispatchQueue(label: "app.qpaste.images", qos: .userInitiated)) throws {
         self.settings = settings
+        self.maximumCaptureBytes = maximumCaptureBytes
+        self.imageQueue = imageQueue
         self.synchronousQueries = synchronousQueries
         repository = try HistoryRepository(directory: directory)
         queryRepository = try HistoryRepository(directory: directory)
@@ -123,6 +139,8 @@ final class HistoryStore: ObservableObject {
     }
 
     func add(_ entry: ClipboardEntry, imageData: Data? = nil, thumbnail: NSImage? = nil) {
+        _ = drainPending()
+        guard canBuffer(bytes: CapturedClipboard(entry: entry, imageData: imageData).retainedBytes) else { return }
         var incoming = entry
         let previous = pendingSaves.last { $0.entry.fingerprint == entry.fingerprint }?.entry
             ?? (try? repository.entry(fingerprint: entry.fingerprint))
@@ -143,9 +161,14 @@ final class HistoryStore: ObservableObject {
 
     /// Captures are decoded serially off-main, then use the same persistence queue
     /// as edits/deletes. No unreferenced image is exposed between its write and row.
-    func makeCaptureWriter() -> (CapturedClipboard?) -> (@MainActor () -> Void) {
+    func makeCaptureWriter(reserving bytes: Int) -> ((CapturedClipboard?) -> (@MainActor () -> Void))? {
         let canWrite = drainPending()
-        let permitID = UUID(), permit = CaptureWritePermit()
+        guard canBuffer(bytes: bytes) else { return nil }
+        guard capturePermits.count < Self.maximumInFlightCaptures else {
+            pauseCapture()
+            return nil
+        }
+        let permitID = UUID(), permit = CaptureWritePermit(reservedBytes: bytes)
         capturePermits[permitID] = permit
         let repository = repository, queue = ioQueue, policy = policy
         return { [weak self] captured in
@@ -154,6 +177,7 @@ final class HistoryStore: ObservableObject {
                 event: CopyEvent(entryID: captured.entry.id, copiedAt: captured.entry.lastCopiedAt,
                                  sourceName: captured.entry.sourceName, sourceBundleID: captured.entry.sourceBundleID))
             var writeError: Error?
+            var removedHistory = false
             if canWrite {
                 do {
                     try queue.sync {
@@ -167,6 +191,7 @@ final class HistoryStore: ObservableObject {
                         guard permit.allows(entry) else { return }
                         if let data = captured.imageData { _ = try repository.saveImage(data) }
                         let removed = try repository.saveChanges(upserting: [entry], copyEvents: pending.event.map { [$0] } ?? [], policy: policy)
+                        removedHistory = removed
                         if removed { try repository.removeUnreferencedImages() }
                     }
                 } catch { writeError = error }
@@ -174,11 +199,12 @@ final class HistoryStore: ObservableObject {
                 pending.event = CopyEvent(entryID: pending.entry.id, copiedAt: pending.entry.lastCopiedAt,
                                           sourceName: pending.entry.sourceName, sourceBundleID: pending.entry.sourceBundleID)
             }
-            let saved = pending, error = writeError
+            let saved = pending, error = writeError, removed = removedHistory
             return {
                 guard let self else { return }
                 self.capturePermits.removeValue(forKey: permitID)
                 guard permit.allows(saved.entry) else { return }
+                if removed { self.clearImageCaches() }
                 if let name = saved.entry.imageFileName, let thumbnail = captured.thumbnail { self.cacheThumbnail(thumbnail, named: name) }
                 self.invalidateContent()
                 if !canWrite || error != nil {
@@ -204,6 +230,35 @@ final class HistoryStore: ObservableObject {
         }
     }
 
+    private func canBuffer(bytes: Int) -> Bool {
+        guard bytes <= maximumCaptureBytes else {
+            notify("这份内容超过暂存容量，未加入历史", isError: true)
+            return false
+        }
+        guard bytes <= maximumCaptureBytes - bufferedCaptureBytes else {
+            pauseCapture()
+            return false
+        }
+        return true
+    }
+
+    private func pauseCapture() {
+        capturePauseReason = "积压过多，已自动暂停；期间的新复制不记录。恢复后自动继续。"
+    }
+
+    func retryBufferedCaptures() {
+        guard capturePermits.isEmpty, !pendingSaves.isEmpty else { return }
+        let previousCount = pendingSaves.count
+        _ = drainPending()
+        if pendingSaves.count != previousCount { invalidateContent(); reload() }
+    }
+
+    func resumeCaptureIfPossible() {
+        guard pendingSaves.isEmpty, capturePermits.count <= Self.maximumInFlightCaptures / 2,
+              bufferedCaptureBytes <= maximumCaptureBytes / 2 else { return }
+        capturePauseReason = nil
+    }
+
     func toggleFavorite(_ entry: ClipboardEntry) { toggleFavorite(id: entry.id, isSnippet: entry.isSnippet) }
     func toggleFavorite(_ item: HistoryListItem) { toggleFavorite(id: item.id, isSnippet: item.isSnippet) }
 
@@ -211,14 +266,15 @@ final class HistoryStore: ObservableObject {
         guard !isSnippet, drainPending() else { return }
         do {
             let policy = policy
-            let changed: ClipboardEntry? = try ioQueue.sync {
+            let changed: (ClipboardEntry, Bool)? = try ioQueue.sync {
                 guard var current = try repository.entry(id: id) else { return nil }
                 current.isFavorite.toggle()
-                try repository.saveChanges(upserting: [current], policy: policy)
+                let removed = try repository.saveChanges(upserting: [current], policy: policy)
                 try repository.removeUnreferencedImages()
-                return current
+                return (current, removed)
             }
-            guard let current = changed else { return }
+            guard let (current, removed) = changed else { return }
+            if removed { clearImageCaches() }
             invalidateContent()
             reload()
             notify(current.isFavorite ? "已加入收藏" : "已取消收藏")
@@ -236,12 +292,14 @@ final class HistoryStore: ObservableObject {
             : remaining.isEmpty ? nil : remaining[min(index, remaining.count - 1)].id
         do {
             let permits = Array(capturePermits.values)
-            try ioQueue.sync {
-                let fingerprint = try repository.entry(id: id)?.fingerprint
+            let imageName: String? = try ioQueue.sync {
+                let entry = try repository.entry(id: id)
                 try repository.saveChanges(deleting: [id])
-                if let fingerprint { permits.forEach { $0.deleted(fingerprint) } }
+                if let fingerprint = entry?.fingerprint { permits.forEach { $0.deleted(fingerprint) } }
                 try repository.removeUnreferencedImages()
+                return entry?.imageFileName
             }
+            if let imageName { clearImageCaches(named: imageName) }
             // Publish the surviving selection before the asynchronous refresh.
             // Other entries' bodies are still valid and can stay in the cache.
             contentCache.remove(id)
@@ -265,6 +323,7 @@ final class HistoryStore: ObservableObject {
                 permits.forEach { $0.cleared(includeFavorites: includeFavorites) }
                 try repository.removeUnreferencedImages()
             }
+            clearImageCaches()
             invalidateContent()
             reload(reset: true)
             notify(includeFavorites ? "历史和收藏已清空，文本片段已保留" : "历史已清空，收藏和文本片段已保留")
@@ -281,13 +340,15 @@ final class HistoryStore: ObservableObject {
                 try repository.removeUnreferencedImages()
                 return removed
             }
+            if removed { clearImageCaches() }
             if removed || hadPendingSaves { invalidateContent(); reload() }
         } catch { reportWriteError(error) }
     }
 
-    func saveSnippet(_ draft: SnippetDraft) {
+    @discardableResult
+    func saveSnippet(_ draft: SnippetDraft) -> Bool {
         let name = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty, !draft.body.isEmpty else { return }
+        guard !name.isEmpty, !draft.body.isEmpty else { return false }
         var saved = draft.entryID.flatMap { id in pendingSaves.last { $0.entry.id == id }?.entry ?? (try? repository.entry(id: id)) }
         if saved?.isSnippet != true { saved = nil }
         var entry = saved ?? ClipboardEntry(kind: .text, fingerprint: "snippet:\(UUID())", sourceName: "文本片段", snippetName: name)
@@ -295,6 +356,8 @@ final class HistoryStore: ObservableObject {
         entry.snippetName = name
         entry.byteCount = draft.body.utf8.count
         entry.updatedAt = Date()
+        _ = drainPending()
+        guard canBuffer(bytes: CapturedClipboard(entry: entry).retainedBytes) else { return false }
         invalidateContent()
         pendingSaves.append(PendingSave(entry: entry))
         let savedToDisk = drainPending()
@@ -303,6 +366,7 @@ final class HistoryStore: ObservableObject {
         filter = .snippets
         reload(preferredID: entry.id)
         if savedToDisk { notify("文本片段已保存") }
+        return true
     }
 
     func editSnippet(from item: HistoryListItem) {
@@ -419,11 +483,13 @@ final class HistoryStore: ObservableObject {
         let policy = policy
         do {
             while let pending = pendingSaves.first {
-                try ioQueue.sync {
+                let removed = try ioQueue.sync {
                     if let data = pending.imageData { _ = try repository.saveImage(data) }
                     let removed = try repository.saveChanges(upserting: [pending.entry], copyEvents: pending.event.map { [$0] } ?? [], policy: policy)
                     if removed { try repository.removeUnreferencedImages() }
+                    return removed
                 }
+                if removed { clearImageCaches() }
                 pendingSaves.removeFirst()
             }
             if hadPendingWriteError { storageError = nil; hadPendingWriteError = false }
@@ -477,6 +543,7 @@ final class HistoryStore: ObservableObject {
     private func refreshSelectedContent() {
         let item = selectedItem
         if selectedContentKey == item, selectedContent != nil || isLoadingContent { return }
+        cancelPreviewImages()
         selectedContentTask?.cancel()
         selectedContent = nil; selectedContentKey = item
         contentError = nil; isLoadingContent = false
@@ -507,14 +574,51 @@ final class HistoryStore: ObservableObject {
     }
 
     func image<Entry: HistoryImageReference>(for entry: Entry) -> NSImage? {
+        cancelImageRequests { $0.kind == "original" && $0.name != entry.imageFileName }
         fullImageRequestName = entry.imageFileName
         if let displayedFullImage, displayedFullImage.name == entry.imageFileName { return displayedFullImage.image }
         return requestImage(entry, pixels: 0, kind: "original", cache: images)
     }
 
-    func releaseFullImage() { fullImageRequestName = nil; displayedFullImage = nil }
+    func releaseFullImage() {
+        cancelImageRequests { $0.kind == "original" }
+        fullImageRequestName = nil; displayedFullImage = nil
+    }
+
+    func cancelPreviewImages() { cancelImageRequests { $0.kind == "preview" } }
+
+    func cancelThumbnail<Entry: HistoryImageReference>(for entry: Entry) {
+        cancelImageRequests { $0.kind == "thumbnail" && $0.name == entry.imageFileName }
+    }
+
+    func cancelImageLoads() {
+        cancelImageRequests { _ in true }
+        releaseFullImage()
+    }
+
+    private func cancelImageRequests(where matches: (ImageRequest) -> Bool) {
+        for key in imageTasks.keys.filter(matches) {
+            guard let request = imageTasks.removeValue(forKey: key) else { continue }
+            request.token.cancel()
+            request.task.cancel()
+        }
+    }
+
+    private func clearImageCaches(named name: String? = nil) {
+        cancelImageRequests { name == nil || $0.name == name }
+        if let name {
+            images.remove(name); previews.remove(name); thumbnails.remove(name)
+            imageFailures.removeAll { $0.name == name }
+            if fullImageRequestName == name { releaseFullImage() }
+        } else {
+            images.removeAll(); previews.removeAll(); thumbnails.removeAll()
+            imageFailures.removeAll()
+            releaseFullImage()
+        }
+    }
 
     func previewImage<Entry: HistoryImageReference>(for entry: Entry) -> NSImage? {
+        cancelImageRequests { $0.kind == "preview" && $0.name != entry.imageFileName }
         let pixels = ImageThumbnail.previewPixelSize(width: entry.imageWidth ?? 1, height: entry.imageHeight ?? 1)
         return requestImage(entry, pixels: pixels, kind: "preview", cache: previews)
     }
@@ -530,10 +634,14 @@ final class HistoryStore: ObservableObject {
 
     func loadPreviewImage<Entry: HistoryImageReference>(for entry: Entry) async throws -> NSImage? {
         try Task.checkCancellation()
-        if let image = previewImage(for: entry) { return image }
+        let pixels = ImageThumbnail.previewPixelSize(width: entry.imageWidth ?? 1, height: entry.imageHeight ?? 1)
+        // Hover has its own request so cancelling it cannot cancel an inline preview.
+        if let image = requestImage(entry, pixels: pixels, kind: "hover", cache: previews) { return image }
         guard let name = entry.imageFileName,
-              let task = imageTasks.first(where: { $0.key.name == name && $0.key.kind == "preview" })?.value else { return nil }
-        let image = await task.value
+              let request = imageTasks[ImageRequest(name: name, pixels: pixels, kind: "hover")] else { return nil }
+        let image = await withTaskCancellationHandler {
+            await request.task.value
+        } onCancel: { request.token.cancel() }
         try Task.checkCancellation()
         return image
     }
@@ -543,36 +651,46 @@ final class HistoryStore: ObservableObject {
         guard let name = entry.imageFileName, let url = repository.imageURL(named: name) else { return nil }
         if let image = cache.value(for: name) { return image }
         let key = ImageRequest(name: name, pixels: pixels, kind: kind)
+        if imageTasks[key]?.token.isCancelled == true { imageTasks.removeValue(forKey: key) }
         guard !imageFailures.contains(key), imageTasks[key] == nil else { return nil }
+        let token = HistoryQueryToken()
         let data = pendingSaves.last(where: { $0.entry.imageFileName == name })?.imageData
-        let load = {
-            autoreleasepool {
+        let load = { () -> NSImage? in
+            guard !token.isCancelled else { return nil }
+            return autoreleasepool {
                 if pixels == 0 { return ImageThumbnail.fullImage(data: data, url: url) }
                 if let data { return ImageThumbnail.make(data: data, maximumPixelSize: pixels) }
                 return ImageThumbnail.make(url: url, maximumPixelSize: pixels)
             }
         }
         if synchronousQueries {
-            guard let image = load() else { return nil }
+            guard let image = load() else { rememberImageFailure(key); return nil }
             cache.insert(image, for: name)
             return image
         }
         let queue = kind == "thumbnail" ? thumbnailQueue : imageQueue
-        imageTasks[key] = Task { [weak self] in
+        let task = Task<NSImage?, Never> { [weak self] in
             let image: NSImage? = await withCheckedContinuation { continuation in
                 queue.async { continuation.resume(returning: load()) }
             }
-            guard let self else { return image }
+            guard let self, self.imageTasks[key]?.token === token else { return nil }
             self.imageTasks.removeValue(forKey: key)
+            guard !token.isCancelled, !Task.isCancelled else { return nil }
             if let image {
                 cache.insert(image, for: name)
                 if kind == "original", self.fullImageRequestName == name { self.displayedFullImage = (name, image) }
             }
-            else { self.imageFailures.insert(key) }
+            else { self.rememberImageFailure(key) }
             self.imageRefresh &+= 1
             return image
         }
+        imageTasks[key] = (token, task)
         return nil
+    }
+
+    private func rememberImageFailure(_ key: ImageRequest) {
+        if imageFailures.count >= 256 { imageFailures.removeFirst() }
+        imageFailures.append(key)
     }
 
     private func cacheThumbnail(_ image: NSImage, named name: String) {

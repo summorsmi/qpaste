@@ -31,4 +31,10 @@ final class ImageMemoryCache {
         values[name] = Value(image: image, bytes: bytes, used: clock)
         byteCount += bytes
     }
+
+    func remove(_ name: String) {
+        if let removed = values.removeValue(forKey: name) { byteCount -= removed.bytes }
+    }
+
+    func removeAll() { values.removeAll(); byteCount = 0 }
 }
