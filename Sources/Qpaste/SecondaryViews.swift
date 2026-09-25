@@ -53,6 +53,19 @@ struct SnippetEditor: View {
     }
 }
 
+private struct SettingsHelpTarget {
+    let text: String
+    let bounds: Anchor<CGRect>
+}
+
+private struct SettingsHelpPreference: PreferenceKey {
+    static var defaultValue: SettingsHelpTarget? { nil }
+
+    static func reduce(value: inout SettingsHelpTarget?, nextValue: () -> SettingsHelpTarget?) {
+        value = nextValue() ?? value
+    }
+}
+
 struct SettingsView: View {
     @ObservedObject var store: HistoryStore
     @ObservedObject var settings: AppSettings
@@ -62,29 +75,29 @@ struct SettingsView: View {
     @ViewState<Bool> private var confirmClear = false
     @ViewState<Bool> private var includeFavorites = false
     @ViewState<Bool> private var accessibilityEnabled = AXIsProcessTrusted()
+    @ViewState<String?> private var hoveredHelp = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("让 Qpaste 顺手一点").font(.system(size: 21, weight: .semibold))
-                    Text("简单设置，然后继续专注。 ").font(.system(size: 12)).foregroundStyle(.secondary)
-                }
+                Text("设置").font(.system(size: 21, weight: .semibold))
                 Spacer()
                 Button { dismiss() } label: { Image(systemName: "xmark").font(.system(size: 12)).padding(7) }
                     .buttonStyle(.plain).foregroundStyle(.secondary).accessibilityLabel("关闭设置").keyboardShortcut(.cancelAction)
-            }.padding(26)
+            }
+            .padding(.horizontal, 26)
+            .padding(.top, 26)
+            .padding(.bottom, 6)
             Form {
                 Section("显示") {
                     Toggle("精简模式", isOn: $settings.isCompact)
                 }
                 Section("使用习惯") {
-                    Picker("呼出快捷键", selection: $settings.shortcut) {
+                    Picker(selection: $settings.shortcut) {
                         ForEach(ShortcutChoice.allCases) { Text($0.label).tag($0) }
-                    }
-                    if settings.shortcut == .doubleCommand {
-                        Text("连续单独轻按 Command 两次即可呼出或收起，组合键不会触发。")
-                            .font(.system(size: 10)).foregroundStyle(.secondary)
+                    } label: {
+                        settingsLabel("呼出快捷键", help: settings.shortcut == .doubleCommand
+                            ? "连续单独轻按 Command 两次即可呼出或收起，组合键不会触发。" : nil)
                     }
                     if let error = store.shortcutError { Text(error).font(.caption).foregroundStyle(.orange) }
                     Toggle("登录 Mac 时启动", isOn: $launchAtLogin)
@@ -92,7 +105,7 @@ struct SettingsView: View {
                     if let loginError { Text(loginError).font(.caption).foregroundStyle(.orange) }
                     Toggle("暂停记录剪贴板", isOn: $settings.isPaused)
                 }
-                Section("历史记录") {
+                Section {
                     Picker("最多保留", selection: $settings.maximumCount) {
                         Text("100 条").tag(100)
                         Text("300 条").tag(300)
@@ -107,12 +120,10 @@ struct SettingsView: View {
                         Text("不按时间清理").tag(0)
                     }.onChange(of: settings.retentionDays) { _, _ in store.applyRetention() }
                     capacityUsage
-                    Text("普通历史达到条数、时间或容量任一限制时自动清理；“不限”只取消条数限制。")
-                        .font(.system(size: 10)).foregroundStyle(.secondary)
-                    Text("收藏和文本片段不会自动清理，也不占用普通历史的 5 GB 额度。")
-                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                } header: {
+                    settingsLabel("历史记录", help: "普通历史达到条数、时间或容量任一限制时自动清理；“不限”只取消条数限制。\n\n收藏和文本片段不会自动清理，也不占用普通历史的 5 GB 额度。")
                 }
-                Section("直接粘贴") {
+                Section {
                     HStack {
                         Label(accessibilityEnabled ? "辅助功能权限已开启" : "需要辅助功能权限", systemImage: accessibilityEnabled ? "checkmark.circle.fill" : "keyboard")
                             .foregroundStyle(accessibilityEnabled ? Color.green : Color.primary)
@@ -121,32 +132,60 @@ struct SettingsView: View {
                             NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
                         }
                     }
-                    Text("授权后，按回车即可粘贴回刚才的应用。复制和手动 ⌘V 无需授权。")
-                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                } header: {
+                    settingsLabel("直接粘贴", help: "授权后，按回车即可粘贴回刚才的应用。复制和手动 ⌘V 无需授权。")
                 }
-                Section("本机存储") {
+                Section {
                     HStack {
                         Text("\(store.historyCount) 条历史 · \(store.snippetCount) 个文本片段")
                         Spacer()
                         Button("打开存储位置") { NSWorkspace.shared.open(store.repository.directory) }
                     }
-                    Text("内容仅存于这台 Mac；按你的偏好，带敏感标记的内容也会记录。")
-                        .font(.system(size: 10)).foregroundStyle(.secondary)
                     if let error = store.capturePauseReason ?? store.storageError { Text(error).font(.caption).foregroundStyle(.orange) }
                     HStack {
                         Toggle("同时清空收藏", isOn: $includeFavorites).toggleStyle(.checkbox)
                         Spacer()
                         Button("清空历史…", role: .destructive) { confirmClear = true }
                     }
+                } header: {
+                    settingsLabel("本机存储", help: "内容仅存于这台 Mac；按你的偏好，带敏感标记的内容也会记录。")
                 }
             }.formStyle(.grouped)
             HStack {
                 Text("Qpaste 1.0").font(.system(size: 10)).foregroundStyle(.tertiary)
                 Spacer()
-                Button("退出 Qpaste") { NSApp.terminate(nil) }.buttonStyle(.plain).font(.system(size: 11)).foregroundStyle(.secondary)
             }.padding(.horizontal, 26).padding(.vertical, 14)
         }
         .frame(width: 560, height: 670).tint(Palette.accent)
+        .overlayPreferenceValue(SettingsHelpPreference.self) { target in
+            GeometryReader { geometry in
+                if let target {
+                    let bounds = geometry[target.bounds]
+                    let showsAbove = bounds.midY > geometry.size.height / 2
+                    Color.clear.overlay(alignment: .topLeading) {
+                        Text(target.text)
+                            .font(.system(size: 12))
+                            .foregroundStyle(.primary)
+                            .multilineTextAlignment(.leading)
+                            .lineSpacing(3)
+                            .padding(12)
+                            .frame(width: 300, alignment: .leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9))
+                            .overlay(RoundedRectangle(cornerRadius: 9).stroke(.primary.opacity(0.12)))
+                            .shadow(color: .black.opacity(0.14), radius: 8, y: 3)
+                            .alignmentGuide(.top) { dimensions in
+                                showsAbove ? dimensions.height + 8 : -8
+                            }
+                            .offset(x: min(max(bounds.minX, 12), geometry.size.width - 312),
+                                    y: showsAbove ? bounds.minY : bounds.maxY)
+                    }
+                }
+            }
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+        }
+        .onDisappear { hoveredHelp = nil }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             accessibilityEnabled = AXIsProcessTrusted()
         }
@@ -155,6 +194,30 @@ struct SettingsView: View {
             Button("清空", role: .destructive) { store.clearHistory(includeFavorites: includeFavorites) }
         } message: {
             Text(includeFavorites ? "历史和收藏会被删除，文本片段会保留。此操作无法撤销。" : "普通历史会被删除，收藏和文本片段会保留。此操作无法撤销。")
+        }
+    }
+
+    private func settingsLabel(_ title: String, help: String?) -> some View {
+        HStack(spacing: 5) {
+            Text(title)
+            if let help {
+                Image(systemName: "questionmark.circle")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .padding(2)
+                    .contentShape(Rectangle())
+                    .onHover { hovering in
+                        if hovering {
+                            hoveredHelp = title
+                        } else if hoveredHelp == title {
+                            hoveredHelp = nil
+                        }
+                    }
+                    .anchorPreference(key: SettingsHelpPreference.self, value: .bounds) { bounds in
+                        hoveredHelp == title ? SettingsHelpTarget(text: help, bounds: bounds) : nil
+                    }
+                    .accessibilityLabel("\(title)说明：\(help)")
+            }
         }
     }
 
@@ -174,12 +237,10 @@ struct SettingsView: View {
                 Text("文本片段 \(capacityLabel(store.usage.snippetBytes))")
             }.foregroundStyle(.secondary)
             HStack {
-                Text("内容合计")
+                settingsLabel("内容合计", help: "按保存的内容大小统计，不含存储索引；文件仅计路径。")
                 Spacer()
                 Text(capacityLabel(store.usage.totalBytes)).monospacedDigit()
             }.foregroundStyle(.secondary)
-            Text("按保存的内容大小统计，不含存储索引；文件仅计路径。")
-                .font(.system(size: 10)).foregroundStyle(.secondary)
         }.font(.system(size: 11)).padding(.vertical, 4)
     }
 
